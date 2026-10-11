@@ -28,9 +28,9 @@ The app reads its configuration from the launch environment. With `devicectl`, p
 For Jellyfin, with an API key in `KEY` and the item and media source ID in `ID`:
 
 ```sh
-export DEVICECTL_CHILD_LUMEN_URL="http://jellyfin:8096/Videos/$ID/stream?static=true&MediaSourceId=$ID&ApiKey=$KEY"
+export DEVICECTL_CHILD_LUMEN_URL="https://jellyfin.example.com/Videos/$ID/stream?static=true&MediaSourceId=$ID&ApiKey=$KEY"
 export DEVICECTL_CHILD_LUMEN_START=420
 xcrun devicectl device process launch --device "DEVICE_ID" --terminate-existing --console "com.example.lumen"
 ```
 
-Keep the key out of shell history and logs.
+Keep the key out of shell history and logs. Use the server's HTTPS address with a certificate the Apple TV trusts: over plain HTTP the key travels unencrypted.
