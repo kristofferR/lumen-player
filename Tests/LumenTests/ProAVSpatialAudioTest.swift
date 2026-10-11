@@ -63,6 +63,10 @@ class ProAVSpatialAudioTest: XCTestCase {
         session.finish(reachedEnd: true)
         let playlist = try String(contentsOf: directory.appendingPathComponent(ProAVRemuxSession.audioPlaylistName), encoding: .utf8)
         XCTAssertTrue(playlist.contains("#EXT-X-MAP:URI=\"audio-init.mp4\"\n#EXTINF:3.20000,\naudio0.m4s\n#EXT-X-ENDLIST\n"))
+        // HLS requires the audio and video playlists of a variant to share one target duration.
+        let media = try String(contentsOf: directory.appendingPathComponent(ProAVRemuxSession.mediaPlaylistName), encoding: .utf8)
+        XCTAssertTrue(playlist.contains("#EXT-X-TARGETDURATION:4\n"))
+        XCTAssertTrue(media.contains("#EXT-X-TARGETDURATION:4\n"))
     }
 
     func testEndingWithoutAPACFragmentsFallsBackToFLAC() {

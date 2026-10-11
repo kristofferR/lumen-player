@@ -184,7 +184,7 @@ public final class ProAVRemuxSession: @unchecked Sendable {
             segmentStart = nextStartTime
             currentHandle = openFileLocked(named: segmentFileName(index: segmentIndex))
             currentSegmentBytes = 0
-            writeMediaPlaylistLocked(ended: false)
+            writePlaylistsLocked(ended: false)
             fireReadyIfNeededLocked(force: false)
         }
     }
@@ -211,10 +211,7 @@ public final class ProAVRemuxSession: @unchecked Sendable {
                     _spatialAudioFailed = true
                     failLocked(NSError(description: "ProAV spatial audio produced no fragments"))
                 } else {
-                    writeMediaPlaylistLocked(ended: true)
-                    if audioSignaling?.mediaPlaylistName != nil {
-                        writeAudioPlaylistLocked(ended: true)
-                    }
+                    writePlaylistsLocked(ended: true)
                     fireReadyIfNeededLocked(force: true)
                 }
             }
@@ -252,7 +249,7 @@ public final class ProAVRemuxSession: @unchecked Sendable {
             writeLocked(data: data, named: fileName)
             guard !failed else { return }
             audioSegments.append(ProAVSegment(fileName: fileName, duration: duration))
-            writeAudioPlaylistLocked(ended: false)
+            writePlaylistsLocked(ended: false)
             fireReadyIfNeededLocked(force: false)
         }
     }
@@ -311,14 +308,15 @@ public final class ProAVRemuxSession: @unchecked Sendable {
         segmentIndex += 1
     }
 
-    private func writeMediaPlaylistLocked(ended: Bool) {
-        let media = ProAVPlaylist.media(targetDuration: configuration.targetSegmentDuration, initSegmentName: Self.initSegmentName, segments: segments, ended: ended)
+    /// Writes the video playlist and the separate audio rendition's, which HLS requires to share one
+    /// target duration, so a longer segment in either raises both.
+    private func writePlaylistsLocked(ended: Bool) {
+        let targetDuration = max(configuration.targetSegmentDuration, (segments + audioSegments).map(\.duration).max() ?? 0)
+        let media = ProAVPlaylist.media(targetDuration: targetDuration, initSegmentName: Self.initSegmentName, segments: segments, ended: ended)
         writeLocked(text: media, to: mediaURL)
-    }
-
-    private func writeAudioPlaylistLocked(ended: Bool) {
-        let media = ProAVPlaylist.media(targetDuration: configuration.targetSegmentDuration, initSegmentName: Self.audioInitSegmentName, segments: audioSegments, ended: ended)
-        writeLocked(text: media, to: configuration.directory.appendingPathComponent(Self.audioPlaylistName))
+        guard audioSignaling?.mediaPlaylistName != nil else { return }
+        let audio = ProAVPlaylist.media(targetDuration: targetDuration, initSegmentName: Self.audioInitSegmentName, segments: audioSegments, ended: ended)
+        writeLocked(text: audio, to: configuration.directory.appendingPathComponent(Self.audioPlaylistName))
     }
 
     private func fireReadyIfNeededLocked(force: Bool) {
