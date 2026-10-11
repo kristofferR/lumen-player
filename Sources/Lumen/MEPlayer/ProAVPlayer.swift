@@ -417,10 +417,17 @@ extension ProAVPlayer: MediaPlayerProtocol {
     }
 
     public func play() {
+        // A command while the FLAC fallback prepares replaces the state it restores.
+        if fallbackResumesPlayback != nil {
+            fallbackResumesPlayback = true
+        }
         innerPlayer.play()
     }
 
     public func pause() {
+        if fallbackResumesPlayback != nil {
+            fallbackResumesPlayback = false
+        }
         innerPlayer.pause()
     }
 
@@ -430,7 +437,8 @@ extension ProAVPlayer: MediaPlayerProtocol {
             completion(false)
             return
         }
-        startSourceSwitch(url: url, options: options, allowsSpatialAudio: allowsSpatialAudio, completion: completion)
+        // A new source tries APAC again; a refusal retries the candidate on FLAC.
+        startSourceSwitch(url: url, options: options, allowsSpatialAudio: true, completion: completion)
     }
 
     public func cancelSourceSwitch() {
