@@ -199,12 +199,11 @@ public final class ProAVPlayer {
         allowsSpatialAudio = false
         let seekCompletion = pendingSeekCompletion
         pendingSeekCompletion = nil
-        let wasPlaying = isPlaying
+        // The remux runs ahead of playback, so a refusal can arrive while this launch plays: keep the
+        // viewer's choice then. A launch that never became ready restarts as the one before it would.
+        let resumesPlayback = isReadyToPlay && seekCompletion == nil ? isPlaying : nil
         restart(at: currentPlaybackTime, completion: seekCompletion)
-        // The remux runs ahead of playback, so a refusal can arrive at any point; keep the viewer's choice.
-        if reportedReady, seekCompletion == nil {
-            fallbackResumesPlayback = wasPlaying
-        }
+        fallbackResumesPlayback = resumesPlayback
     }
 
     private func fail(error: NSError) {
@@ -260,11 +259,14 @@ public final class ProAVPlayer {
 
     /// Retries a candidate whose track the library refused on the FLAC path, as a cold launch would.
     private func pendingSourceSwitchDidFail(_ session: ProAVRemuxSession) {
-        guard let pending = pendingSourceSwitch, session.spatialAudioFailed, !pending.innerSwitchStarted else {
+        guard let pending = pendingSourceSwitch, session.spatialAudioFailed else {
             abortPendingSourceSwitch()
             return
         }
         pendingSourceSwitch = nil
+        if pending.innerSwitchStarted {
+            innerPlayer.abandonPendingSourceSwitch()
+        }
         pending.launch.item.delegate = nil
         pending.launch.item.shutdown()
         pending.launch.session.requestCleanup()
