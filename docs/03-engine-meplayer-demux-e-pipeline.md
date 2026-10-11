@@ -116,6 +116,7 @@ O `ProAVPlayer` é o terceiro engine do fork. Ele **não decodifica nada**: usa 
 | `ProAVSegment` / `ProAVPlaylist` | `ProAVPlaylist.swift` | Modelo de segmento e geração dos textos `master.m3u8`/`media.m3u8` |
 | `ProAVInitBoundaryScanner` | `ProAVInitBoundaryScanner.swift` | Box-walk ISOBMFF sobre o stream do muxer: acha a fronteira entre o init segment e o primeiro `moof` |
 | `ProAVAudioTranscoder` | `ProAVAudioTranscoder.swift` | Transcode de áudio não suportado pelo HLS para FLAC |
+| `ProAVSpatialAudioTranscoder` | `ProAVSpatialAudioTranscoder.swift` | Conversão de TrueHD Atmos e DTS:X para APAC com o SpatialAudioBridge, servida como rendition de áudio separada |
 | `DOVIPacketRewriter` | `DOVIPacketRewriter.swift` | Reescrita de packet HEVC para converter Dolby Vision perfil 7 em 8.1 (libdovi) |
 
 ### Fluxo
@@ -143,7 +144,9 @@ O `ProAVPlayer` é o terceiro engine do fork. Ele **não decodifica nada**: usa 
 
 Áudio, por `ProAVAudioStrategy`: EC-3, AC-3, AAC, FLAC e ALAC passam por **stream copy**; qualquer outro codec (DTS, TrueHD, PCM, Opus…) é **transcodificado para FLAC** por `ProAVAudioTranscoder` (S16 ou S32/24 bits, sample rate e layout de canais preservados, PTS regenerado por contagem de amostras). Se o transcoder não puder inicializar, a trilha de áudio é simplesmente descartada.
 
-A trilha de áudio também é anunciada na master playlist, como uma rendition `#EXT-X-MEDIA:TYPE=AUDIO` sem `URI` (o áudio está muxado na própria variante) referenciada por `AUDIO="main"`. O `CHANNELS` vem de `ch_layout.nb_channels`, **exceto** em E-AC-3 cujo `codecpar.profile` é `AV_PROFILE_EAC3_DDP_ATMOS`: aí o valor é `16/JOC`, que é como a HLS Authoring Specification pede para DD+ com Atmos. Quando a sondagem não fecha a contagem de canais (`nb_channels == 0`), o atributo é **omitido** em vez de sair como `CHANNELS="0"`.
+No tvOS, iOS e macOS 26 ou mais novos, TrueHD e DTS-HD MA a 48 kHz tentam primeiro o **APAC**: `ProAVSpatialAudioTranscoder` entrega os packets demuxados ao `SpatialAudioTranscoder` do [SpatialAudioBridge](https://github.com/kristofferR/SpatialAudioBridge), que renderiza os objetos Atmos ou DTS:X em 7.1.4 e codifica APAC. O vídeo é muxado sozinho, e os fragmentos APAC (`audio-init.mp4`, `audio0.m4s`, …) ganham a própria `audio.m3u8`, anunciada com `URI` no `#EXT-X-MEDIA`, `CHANNELS="12"` e `apac.31.03` no `CODECS`. O muxer rebaseia a timeline para que o primeiro packet de vídeo decodifique em zero; o áudio leva o mesmo deslocamento e começa no primeiro frame de vídeo. A thread de leitura bloqueia enquanto a conversão está atrasada, então o remux anda no ritmo dela, e o gate de prontidão espera também o primeiro fragmento APAC. Trilhas sem Atmos ou DTS:X, ou com metadata que a biblioteca não renderiza, falham a sessão assim que a decodificação começa (`spatialAudioFailed`); o `ProAVPlayer` então reinicia o launch na posição atual pelo caminho FLAC, que vale para o resto do item ou até outra trilha ser escolhida. Enquanto o APAC toca, um `AtmosOutputActivator` toca um stream Dolby Digital Plus Atmos silencioso ao lado, que é o que faz o receiver mudar para Atmos.
+
+Nos demais casos, a trilha de áudio também é anunciada na master playlist, como uma rendition `#EXT-X-MEDIA:TYPE=AUDIO` sem `URI` (o áudio está muxado na própria variante) referenciada por `AUDIO="main"`. O `CHANNELS` vem de `ch_layout.nb_channels`, **exceto** em E-AC-3 cujo `codecpar.profile` é `AV_PROFILE_EAC3_DDP_ATMOS`: aí o valor é `16/JOC`, que é como a HLS Authoring Specification pede para DD+ com Atmos. Quando a sondagem não fecha a contagem de canais (`nb_channels == 0`), o atributo é **omitido** em vez de sair como `CHANNELS="0"`.
 
 ### Conversão de Dolby Vision perfil 7
 
