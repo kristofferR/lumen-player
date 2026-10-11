@@ -82,6 +82,7 @@ There are two floors, and they are not the same one:
 Scrub thumbnails are tvOS-only, at any version.
 
 - Swift 5.9+ / Xcode 15+
+- SpatialAudioBridge, which converts TrueHD Atmos and DTS:X, ships arm64 slices only: build macOS apps for Apple silicon (`ARCHS=arm64`). Mac Catalyst builds leave it out and keep the FLAC path
 
 ## Installation
 
