@@ -115,6 +115,7 @@ final class ProAVSpatialAudioTranscoder: @unchecked Sendable {
         var transcoder: SpatialAudioTranscoder?
         var timeline: (origin: CMTime, start: CMTime)?
         var held = [(data: Data, time: CMTime?)]()
+        var unstartedBytes = 0
         var failed = false
         // Any library error ends the session at once, so the player restarts on the FLAC path.
         func fail(_ error: Error) {
@@ -160,6 +161,14 @@ final class ProAVSpatialAudioTranscoder: @unchecked Sendable {
                         try await append(packet.data, time: packet.time)
                     }
                 case let .packet(data, time):
+                    // Audio held for the timeline or skipped to a sync point is bounded, so a stream that
+                    // never starts the conversion falls back to FLAC instead of buffering the file.
+                    if transcoder == nil {
+                        unstartedBytes += data.count
+                        guard unstartedBytes <= 8 << 20 else {
+                            throw SpatialAudioError.source("No sync point or video timeline within 8 MB of audio")
+                        }
+                    }
                     try await append(data, time: time)
                 }
             } catch {
