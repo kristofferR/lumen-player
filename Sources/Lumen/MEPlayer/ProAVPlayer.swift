@@ -248,10 +248,16 @@ public final class ProAVPlayer {
                 self.pendingSourceSwitchDidBecomeReady()
             }
         }
-        launch.session.onFailure = { [weak self, weak session = launch.session] _ in
+        // One handler serves the candidate while it is pending and once it is committed, so a failure
+        // that arrives during the commit still reaches the active session.
+        launch.session.onFailure = { [weak self, weak session = launch.session] sessionError in
             runOnMainThread {
-                guard let self, let session, self.pendingSourceSwitch?.launch.session === session else { return }
-                self.pendingSourceSwitchDidFail(session)
+                guard let self, let session else { return }
+                if self.pendingSourceSwitch?.launch.session === session {
+                    self.pendingSourceSwitchDidFail(session)
+                } else if self.session === session {
+                    self.sessionDidFail(session, error: sessionError)
+                }
             }
         }
         launch.item.prepareToPlay()
@@ -310,12 +316,6 @@ public final class ProAVPlayer {
         activeLaunchIndex = pending.launch.index
         startOffset = pending.startOffset
         pending.launch.session.onReady = nil
-        pending.launch.session.onFailure = { [weak self, weak session = pending.launch.session] sessionError in
-            runOnMainThread {
-                guard let self, let session, self.session === session else { return }
-                self.sessionDidFail(session, error: sessionError)
-            }
-        }
         previousItem?.shutdown()
         previousSession?.requestCleanup()
         if session?.videoSignaling?.preferredDynamicRange != previousDynamicRange {
