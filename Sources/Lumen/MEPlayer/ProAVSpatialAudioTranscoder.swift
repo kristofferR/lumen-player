@@ -73,7 +73,8 @@ final class ProAVSpatialAudioTranscoder: @unchecked Sendable {
 
     func append(packet: UnsafeMutablePointer<AVPacket>) {
         guard let data = packet.pointee.data, packet.pointee.size > 0 else { return }
-        let time = packet.pointee.pts == Int64.min ? nil : timebase.cmtime(for: packet.pointee.pts)
+        let timestamp = packet.pointee.pts == Int64.min ? packet.pointee.dts : packet.pointee.pts
+        let time = timestamp == Int64.min ? nil : timebase.cmtime(for: timestamp)
         capacity.wait()
         queue.yield(.packet(Data(bytes: data, count: Int(packet.pointee.size)), time: time))
     }

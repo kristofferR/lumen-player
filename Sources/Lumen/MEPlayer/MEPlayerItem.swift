@@ -504,11 +504,11 @@ extension MEPlayerItem {
         outputPacket.pointee.stream_index = Int32(outputIndex)
         av_packet_rescale_ts(outputPacket, inputStream.pointee.time_base, outputStream.pointee.time_base)
         outputPacket.pointee.pos = -1
-        if let remuxSpatialAudio, !remuxSpatialAudio.hasTimeline, outputStream.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_VIDEO, outputPacket.pointee.pts != Int64.min {
+        let pts = outputPacket.pointee.pts == Int64.min ? outputPacket.pointee.dts : outputPacket.pointee.pts
+        if let remuxSpatialAudio, !remuxSpatialAudio.hasTimeline, outputStream.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_VIDEO, pts != Int64.min {
             // The muxer shifts its timeline so that the first packet decodes at zero, deriving a missing
             // decode time from the reorder delay as it does. The APAC rendition follows the same shift.
             let timebase = Timebase(outputStream.pointee.time_base)
-            let pts = outputPacket.pointee.pts
             let dts = outputPacket.pointee.dts == Int64.min ? pts - Int64(outputStream.pointee.codecpar.pointee.video_delay) * outputPacket.pointee.duration : outputPacket.pointee.dts
             remuxSpatialAudio.begin(origin: timebase.cmtime(for: dts), videoStart: timebase.cmtime(for: pts))
         }
