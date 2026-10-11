@@ -3,6 +3,9 @@ import Foundation
 #if os(tvOS) || os(xrOS)
 import DisplayCriteria
 #endif
+#if canImport(SpatialAudioPlayback)
+import SpatialAudioPlayback
+#endif
 #if canImport(UIKit)
 import UIKit
 #else
@@ -30,6 +33,8 @@ public final class ProAVPlayer {
     private var delegateProxy: ProAVLaunchDelegateProxy?
     private var pendingSourceSwitch: PendingSourceSwitch?
     private var preferredAudioTrackID: Int32?
+    private var allowsSpatialAudio = true
+    private var atmosOutput: AnyObject?
     private var reportedReady = false
     private var didFail = false
     public weak var delegate: MediaPlayerDelegate?
@@ -80,6 +85,7 @@ public final class ProAVPlayer {
         let configuration = ProAVRemuxSession.Configuration(directory: directory, targetSegmentDuration: ProAVPlayer.segmentDuration, minimumSegmentsBeforeReady: ProAVPlayer.minimumSegmentsBeforeReady)
         let session = ProAVRemuxSession(configuration: configuration)
         session.preferredAudioTrackID = audioTrackID
+        session.allowsSpatialAudio = allowsSpatialAudio
         options.startPlayTime = time
         let item = MEPlayerItem(url: url, options: options, remuxSession: session)
         let proxy = ProAVLaunchDelegateProxy(target: self, launch: launchIndex)
@@ -98,7 +104,7 @@ public final class ProAVPlayer {
         launch.session.onFailure = { [weak self, weak session = launch.session] sessionError in
             runOnMainThread {
                 guard let self, let session, self.session === session else { return }
-                self.fail(error: sessionError)
+                self.sessionDidFail(session, error: sessionError)
             }
         }
         session = launch.session
@@ -133,8 +139,36 @@ public final class ProAVPlayer {
     private func attach(baseURL: URL, directoryName: String) {
         guard !didFail else { return }
         let masterURL = baseURL.appendingPathComponent(directoryName).appendingPathComponent(ProAVRemuxSession.masterPlaylistName)
+        updateAtmosOutput()
         innerPlayer.replace(url: masterURL, options: options)
         innerPlayer.prepareToPlay()
+    }
+
+    /// Keeps the receiver in Dolby Atmos while the active launch plays APAC, which alone does not switch it.
+    private func updateAtmosOutput() {
+        #if canImport(SpatialAudioPlayback)
+        guard #available(macOS 26, iOS 26, tvOS 26, *) else { return }
+        guard session?.playsSpatialAudio == true else {
+            detachAtmosOutput()
+            return
+        }
+        guard atmosOutput == nil else { return }
+        #if !os(macOS)
+        try? AVAudioSession.sharedInstance().setSupportsMultichannelContent(true)
+        #endif
+        let activator = AtmosOutputActivator()
+        activator.attach(to: innerPlayer.player)
+        atmosOutput = activator
+        #endif
+    }
+
+    private func detachAtmosOutput() {
+        #if canImport(SpatialAudioPlayback)
+        if #available(macOS 26, iOS 26, tvOS 26, *) {
+            (atmosOutput as? AtmosOutputActivator)?.detach()
+        }
+        #endif
+        atmosOutput = nil
     }
 
     private func applyDisplayCriteria() {
@@ -151,6 +185,20 @@ public final class ProAVPlayer {
         #endif
     }
 
+    private func sessionDidFail(_ session: ProAVRemuxSession, error: NSError) {
+        guard session.spatialAudioFailed else {
+            fail(error: error)
+            return
+        }
+        // The track has no Atmos or DTS:X, or metadata the library cannot render, so it plays through
+        // the FLAC transcode from here on.
+        KSLog(level: .info, "\(error.localizedDescription); falling back to FLAC")
+        allowsSpatialAudio = false
+        let seekCompletion = pendingSeekCompletion
+        pendingSeekCompletion = nil
+        restart(at: currentPlaybackTime, completion: seekCompletion)
+    }
+
     private func fail(error: NSError) {
         abortPendingSourceSwitch()
         guard !didFail else { return }
@@ -159,6 +207,7 @@ public final class ProAVPlayer {
         pendingSeekCompletion = nil
         seekCompletion?(false)
         remuxItem?.delegate = nil
+        detachAtmosOutput()
         innerPlayer.shutdown()
         remuxItem?.shutdown()
         session?.requestCleanup()
@@ -220,7 +269,7 @@ public final class ProAVPlayer {
         pending.launch.session.onFailure = { [weak self, weak session = pending.launch.session] sessionError in
             runOnMainThread {
                 guard let self, let session, self.session === session else { return }
-                self.fail(error: sessionError)
+                self.sessionDidFail(session, error: sessionError)
             }
         }
         previousItem?.shutdown()
@@ -228,6 +277,7 @@ public final class ProAVPlayer {
         if session?.videoSignaling?.preferredDynamicRange != previousDynamicRange {
             applyDisplayCriteria()
         }
+        updateAtmosOutput()
         pending.completion(true)
     }
 
@@ -317,6 +367,7 @@ extension ProAVPlayer: MediaPlayerProtocol {
         didFail = false
         reportedReady = false
         preferredAudioTrackID = nil
+        allowsSpatialAudio = true
         self.url = url
         self.options = options
     }
@@ -363,6 +414,7 @@ extension ProAVPlayer: MediaPlayerProtocol {
         pendingSeekCompletion = nil
         seekCompletion?(false)
         remuxItem?.delegate = nil
+        detachAtmosOutput()
         innerPlayer.shutdown()
         remuxItem?.shutdown()
         session?.requestCleanup()
@@ -399,6 +451,7 @@ extension ProAVPlayer: MediaPlayerProtocol {
         guard track.mediaType == .audio else { return }
         guard preferredAudioTrackID != track.trackID else { return }
         preferredAudioTrackID = track.trackID
+        allowsSpatialAudio = true
         remuxItem?.assetTracks.filter { $0.mediaType == .audio }.forEach { $0.isEnabled = $0.trackID == track.trackID }
         restart(at: currentPlaybackTime, completion: nil)
     }

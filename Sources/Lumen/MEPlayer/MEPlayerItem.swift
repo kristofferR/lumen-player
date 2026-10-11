@@ -25,6 +25,7 @@ public final class MEPlayerItem: Sendable {
     private let remuxSession: ProAVRemuxSession?
     private var remuxTranscoder: ProAVAudioTranscoder?
     private var remuxTranscodeStreamIndex: Int?
+    private var remuxSpatialAudio: ProAVSpatialAudioTranscoder?
     private var remuxCompleted = false
     private var remuxHeaderWritten = false
     private var remuxMoovWritten = false
@@ -357,7 +358,10 @@ extension MEPlayerItem {
         let audioAssetTrack = audios.first { preferredAudioTrackID == nil ? $0.isEnabled : $0.trackID == preferredAudioTrackID } ?? audios.first { $0.isEnabled } ?? audios.first
         if let audioAssetTrack, let inputAudioStream = formatCtx.pointee.streams[Int(audioAssetTrack.trackID)] {
             let strategy = ProAVAudioStrategy.make(codecpar: audioAssetTrack.codecpar)
-            if strategy.copiesBitstream {
+            if session.allowsSpatialAudio, let spatialAudio = ProAVSpatialAudioTranscoder(stream: inputAudioStream, session: session) {
+                remuxSpatialAudio = spatialAudio
+                audioSignaling = spatialAudio.signaling
+            } else if strategy.copiesBitstream {
                 if let outputAudioStream = avformat_new_stream(outputFormatCtx, nil) {
                     avcodec_parameters_copy(outputAudioStream.pointee.codecpar, inputAudioStream.pointee.codecpar)
                     outputAudioStream.pointee.codecpar.pointee.codec_tag = 0
@@ -381,7 +385,7 @@ extension MEPlayerItem {
             } else {
                 KSLog("ProAV audio track skipped: flac transcode unavailable")
             }
-            if streamMapping[Int(audioAssetTrack.trackID)] != nil {
+            if streamMapping[Int(audioAssetTrack.trackID)] != nil || remuxSpatialAudio != nil {
                 audios.forEach { $0.isEnabled = $0.trackID == audioAssetTrack.trackID }
             }
         }
@@ -437,6 +441,10 @@ extension MEPlayerItem {
     private func writeProAVPacket(corePacket: UnsafeMutablePointer<AVPacket>, outputFormatCtx: UnsafeMutablePointer<AVFormatContext>, formatCtx: UnsafeMutablePointer<AVFormatContext>, session: ProAVRemuxSession) {
         guard !session.isFailed else { return }
         let index = Int(corePacket.pointee.stream_index)
+        if let remuxSpatialAudio, remuxSpatialAudio.streamIndex == index {
+            remuxSpatialAudio.append(packet: corePacket)
+            return
+        }
         guard let outputIndex = streamMapping[index],
               let inputStream = formatCtx.pointee.streams[index],
               let outputStream = outputFormatCtx.pointee.streams[outputIndex]
@@ -496,6 +504,14 @@ extension MEPlayerItem {
         outputPacket.pointee.stream_index = Int32(outputIndex)
         av_packet_rescale_ts(outputPacket, inputStream.pointee.time_base, outputStream.pointee.time_base)
         outputPacket.pointee.pos = -1
+        if let remuxSpatialAudio, !remuxSpatialAudio.hasTimeline, outputStream.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_VIDEO, outputPacket.pointee.pts != Int64.min {
+            // The muxer shifts its timeline so that the first packet decodes at zero, deriving a missing
+            // decode time from the reorder delay as it does. The APAC rendition follows the same shift.
+            let timebase = Timebase(outputStream.pointee.time_base)
+            let pts = outputPacket.pointee.pts
+            let dts = outputPacket.pointee.dts == Int64.min ? pts - Int64(outputStream.pointee.codecpar.pointee.video_delay) * outputPacket.pointee.duration : outputPacket.pointee.dts
+            remuxSpatialAudio.begin(origin: timebase.cmtime(for: dts), videoStart: timebase.cmtime(for: pts))
+        }
         let ret = av_write_frame(outputFormatCtx, outputPacket)
         if ret < 0 {
             KSLog("ProAV remux can not av_write_frame")
@@ -540,6 +556,12 @@ extension MEPlayerItem {
     private func finishRemux(reachedEnd: Bool) {
         guard let remuxSession, !remuxCompleted else { return }
         remuxCompleted = true
+        if reachedEnd, !remuxSession.isFailed {
+            remuxSpatialAudio?.finish()
+        } else {
+            remuxSpatialAudio?.cancel()
+        }
+        remuxSpatialAudio = nil
         if let outputFormatCtx, remuxHeaderWritten {
             if reachedEnd, let remuxTranscoder, let streamIndex = remuxTranscodeStreamIndex,
                let outputIndex = streamMapping[streamIndex],
