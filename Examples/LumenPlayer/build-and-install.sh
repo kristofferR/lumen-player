@@ -8,7 +8,7 @@ TEAM="${LUMEN_DEVELOPMENT_TEAM:?Set LUMEN_DEVELOPMENT_TEAM to the team that sign
 BUNDLE_ID="${LUMEN_BUNDLE_ID:?Set LUMEN_BUNDLE_ID to a bundle identifier that team can sign}"
 xcodegen generate --spec "$APP_DIR/project.yml"
 xcodebuild -project "$APP_DIR/LumenPlayer.xcodeproj" -scheme LumenPlayer \
-  -destination "id=$DEVICE_ID" -derivedDataPath "$APP_DIR/DerivedData" \
+  -destination "generic/platform=tvOS" -derivedDataPath "$APP_DIR/DerivedData" \
   -allowProvisioningUpdates DEVELOPMENT_TEAM="$TEAM" PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
   build > "$APP_DIR/build.log" 2>&1 \
   || { tail -n 30 "$APP_DIR/build.log"; echo "Build failed; see $APP_DIR/build.log" >&2; exit 1; }
