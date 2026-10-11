@@ -206,6 +206,10 @@ public final class ProAVRemuxSession: @unchecked Sendable {
             if reachedEnd, !failed {
                 if segments.isEmpty {
                     failLocked(NSError(description: "ProAV remux produced no segments"))
+                } else if audioSignaling?.mediaPlaylistName != nil, audioSegments.isEmpty {
+                    // The session could never become ready; the FLAC transcode can still play the track.
+                    _spatialAudioFailed = true
+                    failLocked(NSError(description: "ProAV spatial audio produced no fragments"))
                 } else {
                     writeMediaPlaylistLocked(ended: true)
                     if audioSignaling?.mediaPlaylistName != nil {

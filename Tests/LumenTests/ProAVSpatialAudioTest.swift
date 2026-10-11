@@ -65,6 +65,19 @@ class ProAVSpatialAudioTest: XCTestCase {
         XCTAssertTrue(playlist.contains("#EXT-X-MAP:URI=\"audio-init.mp4\"\n#EXTINF:3.20000,\naudio0.m4s\n#EXT-X-ENDLIST\n"))
     }
 
+    func testEndingWithoutAPACFragmentsFallsBackToFLAC() {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let session = ProAVRemuxSession(configuration: .init(directory: directory))
+        let video = ProAVVideoSignaling(codecTag: "avc1", codecsAttribute: "avc1.640028", videoRange: "SDR", supplementalCodecs: nil, preferredDynamicRange: .sdr)
+        XCTAssertTrue(session.begin(signaling: video, audioSignaling: apac, bandwidth: 12_000_000, resolution: CGSize(width: 1920, height: 1080), frameRate: 23.976))
+        session.closeSegment(nextStartTime: 0)
+        session.closeSegment(nextStartTime: 2)
+        session.finish(reachedEnd: true)
+        XCTAssertTrue(session.isFailed)
+        XCTAssertTrue(session.spatialAudioFailed)
+    }
+
     func testOnlySpatialAudioFailuresFallBackToFLAC() {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let failed = ProAVRemuxSession(configuration: .init(directory: directory))
