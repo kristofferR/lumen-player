@@ -3,7 +3,7 @@ import Foundation
 #if os(tvOS) || os(xrOS)
 import DisplayCriteria
 #endif
-#if os(tvOS) && canImport(SpatialAudioPlayback)
+#if (os(tvOS) || os(iOS)) && canImport(SpatialAudioPlayback)
 import SpatialAudioPlayback
 #endif
 #if canImport(UIKit)
@@ -40,7 +40,7 @@ public final class ProAVPlayer {
     private var fallbackResumesPlayback: Bool?
     private var playbackTimeObserver: Any?
     private var externalPlaybackObservation: NSKeyValueObservation?
-    /// The AtmosOutputActivator while a launch plays APAC on tvOS; releasing it detaches it.
+    /// The AtmosOutputActivator while a launch plays APAC on tvOS or iOS; releasing it detaches it.
     private var atmosOutput: AnyObject?
     private var reportedReady = false
     private var didFail = false
@@ -172,12 +172,12 @@ public final class ProAVPlayer {
         innerPlayer.prepareToPlay()
     }
 
-    /// On tvOS keeps the receiver in Dolby Atmos while the active launch plays APAC, which APAC alone
-    /// does not switch.
+    /// Plays the activator while the active launch plays APAC on this device: APAC alone doesn't switch
+    /// a receiver to Dolby Atmos, and AirPods render it flatter without it.
     private func updateSpatialAudioOutput() {
-        #if os(tvOS) && canImport(SpatialAudioPlayback)
-        guard #available(tvOS 26, *) else { return }
-        guard session?.playsSpatialAudio == true else {
+        #if (os(tvOS) || os(iOS)) && canImport(SpatialAudioPlayback)
+        guard #available(tvOS 26, iOS 26, *) else { return }
+        guard session?.playsSpatialAudio == true, !innerPlayer.isExternalPlaybackActive else {
             atmosOutput = nil
             return
         }
@@ -217,6 +217,8 @@ public final class ProAVPlayer {
 
     private func externalPlaybackDidChange(isActive: Bool) {
         guard !didFail else { return }
+        // The activator stops as AirPlay starts, ahead of the restart without APAC.
+        updateSpatialAudioOutput()
         guard isActive else {
             // Back on this device, a launch that left APAC out for AirPlay brings it back.
             if session?.spatialAudioWithheld == true {

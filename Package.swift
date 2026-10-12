@@ -23,7 +23,7 @@ let package = Package(
                 .product(name: "FFmpegKit", package: "FFmpegKit"),
                 // The core has no Mac Catalyst slices; the Atmos activator is for Apple TV's HDMI output.
                 .product(name: "SpatialAudioBridge", package: "SpatialAudioBridge", condition: .when(platforms: [.tvOS, .iOS, .macOS])),
-                .product(name: "SpatialAudioPlayback", package: "SpatialAudioBridge", condition: .when(platforms: [.tvOS])),
+                .product(name: "SpatialAudioPlayback", package: "SpatialAudioBridge", condition: .when(platforms: [.tvOS, .iOS])),
 //                .product(name: "Libass", package: "FFmpegKit"),
 //                .product(name: "Libmpv", package: "FFmpegKit"),
                 "DisplayCriteria",
