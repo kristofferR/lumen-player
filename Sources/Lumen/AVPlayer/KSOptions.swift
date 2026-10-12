@@ -555,6 +555,17 @@ public extension KSOptions {
         #endif
     }
 
+    /// Multichannel content is on while the remux plays APAC, as the Atmos output was tested.
+    static func setSupportsMultichannelContent(_ supports: Bool) {
+        #if !os(macOS)
+        audioSessionQueue.async {
+            if #available(tvOS 15.0, iOS 15.0, *) {
+                try? AVAudioSession.sharedInstance().setSupportsMultichannelContent(supports)
+            }
+        }
+        #endif
+    }
+
     #if !os(macOS)
     static func isSpatialAudioEnabled(channelCount _: AVAudioChannelCount) -> Bool {
         if #available(tvOS 15.0, iOS 15.0, *) {

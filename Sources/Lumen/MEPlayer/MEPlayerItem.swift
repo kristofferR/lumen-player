@@ -358,7 +358,7 @@ extension MEPlayerItem {
         let audioAssetTrack = audios.first { preferredAudioTrackID == nil ? $0.isEnabled : $0.trackID == preferredAudioTrackID } ?? audios.first { $0.isEnabled } ?? audios.first
         if let audioAssetTrack, let inputAudioStream = formatCtx.pointee.streams[Int(audioAssetTrack.trackID)] {
             let strategy = ProAVAudioStrategy.make(codecpar: audioAssetTrack.codecpar)
-            if session.allowsSpatialAudio, let spatialAudio = ProAVSpatialAudioTranscoder(stream: inputAudioStream, session: session) {
+            if session.spatialAudioPolicy.allows(trackID: audioAssetTrack.trackID), let spatialAudio = ProAVSpatialAudioTranscoder(stream: inputAudioStream, session: session) {
                 remuxSpatialAudio = spatialAudio
                 audioSignaling = spatialAudio.signaling
             } else if strategy.copiesBitstream {
@@ -504,13 +504,10 @@ extension MEPlayerItem {
         outputPacket.pointee.stream_index = Int32(outputIndex)
         av_packet_rescale_ts(outputPacket, inputStream.pointee.time_base, outputStream.pointee.time_base)
         outputPacket.pointee.pos = -1
-        let pts = outputPacket.pointee.pts == Int64.min ? outputPacket.pointee.dts : outputPacket.pointee.pts
-        if let remuxSpatialAudio, !remuxSpatialAudio.hasTimeline, outputStream.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_VIDEO, pts != Int64.min {
-            // The muxer shifts its timeline so that the first packet decodes at zero, deriving a missing
-            // decode time from the reorder delay as it does. The APAC rendition follows the same shift.
-            let timebase = Timebase(outputStream.pointee.time_base)
-            let dts = outputPacket.pointee.dts == Int64.min ? pts - Int64(outputStream.pointee.codecpar.pointee.video_delay) * outputPacket.pointee.duration : outputPacket.pointee.dts
-            remuxSpatialAudio.begin(origin: timebase.cmtime(for: dts), videoStart: timebase.cmtime(for: pts))
+        if let remuxSpatialAudio, !remuxSpatialAudio.hasTimeline, outputStream.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_VIDEO,
+           let timeline = ProAVSpatialAudioTranscoder.timeline(pts: outputPacket.pointee.pts, dts: outputPacket.pointee.dts, duration: outputPacket.pointee.duration, videoDelay: outputStream.pointee.codecpar.pointee.video_delay, timebase: Timebase(outputStream.pointee.time_base))
+        {
+            remuxSpatialAudio.begin(origin: timeline.origin, videoStart: timeline.videoStart)
         }
         let ret = av_write_frame(outputFormatCtx, outputPacket)
         if ret < 0 {
@@ -1101,7 +1098,15 @@ extension MEPlayerItem: MediaPlayback {
 
 extension MEPlayerItem: CodecCapacityDelegate {
     func codecDidChangeCapacity() {
-        guard remuxSession == nil else {
+        if let remuxSession {
+            // The remux reads ahead of playback by the buffer duration, as the decoding path buffers.
+            if let ahead = remuxSession.remuxedAhead {
+                if ahead > options.maxBufferDuration {
+                    pause()
+                } else if ahead < options.maxBufferDuration / 2 {
+                    resume()
+                }
+            }
             return
         }
         let loadingState = options.playable(capacitys: videoAudioTracks, isFirst: isFirst, isSeek: isSeek)
