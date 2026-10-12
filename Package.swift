@@ -21,7 +21,7 @@ let package = Package(
             name: "Lumen",
             dependencies: [
                 .product(name: "FFmpegKit", package: "FFmpegKit"),
-                // The core ships arm64 slices for Apple TV, iPhone, iPad and Mac, without Mac Catalyst.
+                // The core has no Mac Catalyst slices.
                 .product(name: "SpatialAudioBridge", package: "SpatialAudioBridge", condition: .when(platforms: [.tvOS, .iOS, .macOS])),
                 .product(name: "SpatialAudioPlayback", package: "SpatialAudioBridge", condition: .when(platforms: [.tvOS, .iOS, .macOS])),
 //                .product(name: "Libass", package: "FFmpegKit"),
@@ -46,5 +46,5 @@ let package = Package(
 
 package.dependencies += [
     .package(path: "FFmpegKit"),
-    .package(url: "https://github.com/kristofferR/SpatialAudioBridge", from: "1.3.0"),
+    .package(url: "https://github.com/kristofferR/SpatialAudioBridge", from: "1.5.0"),
 ]
