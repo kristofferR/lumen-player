@@ -1100,7 +1100,7 @@ extension MEPlayerItem: CodecCapacityDelegate {
     func codecDidChangeCapacity() {
         if let remuxSession {
             // The remux reads ahead of playback by the buffer duration, as the decoding path buffers.
-            if let ahead = remuxSession.remuxedAhead {
+            if let ahead = remuxSession.remuxedAhead(sourceStart: startTime.seconds) {
                 if ahead > options.maxBufferDuration {
                     pause()
                 } else if ahead < options.maxBufferDuration / 2 {

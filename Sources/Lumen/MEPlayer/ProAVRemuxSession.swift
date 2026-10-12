@@ -108,7 +108,7 @@ public final class ProAVRemuxSession: @unchecked Sendable {
         withLock { _spatialAudioFailure }
     }
 
-    /// The player's position, in source time, which the remux reads ahead of.
+    /// The player's position from the start of the file, which the remux reads ahead of.
     var playbackTime: TimeInterval? {
         get {
             withLock { _playbackTime }
@@ -118,11 +118,12 @@ public final class ProAVRemuxSession: @unchecked Sendable {
         }
     }
 
-    /// How far the remuxed video runs ahead of playback, once both are known.
-    var remuxedAhead: TimeInterval? {
+    /// How far the remuxed video runs ahead of playback, once both are known. Video times are the
+    /// source's own, which start at `sourceStart`.
+    func remuxedAhead(sourceStart: TimeInterval) -> TimeInterval? {
         withLock {
             guard let lastVideoSeconds, let _playbackTime else { return nil }
-            return lastVideoSeconds - _playbackTime
+            return lastVideoSeconds - sourceStart - _playbackTime
         }
     }
 

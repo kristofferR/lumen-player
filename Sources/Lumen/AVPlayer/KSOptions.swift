@@ -555,12 +555,28 @@ public extension KSOptions {
         #endif
     }
 
-    /// Multichannel content is on while the remux plays APAC, as the Atmos output was tested.
-    static func setSupportsMultichannelContent(_ supports: Bool) {
+    // Only touched on the audio session queue.
+    private nonisolated(unsafe) static var multichannelContentHolders = 0
+    private nonisolated(unsafe) static var multichannelContentBeforeHolders = false
+
+    /// Multichannel content is on while any remux plays APAC, as the Atmos output was tested, and
+    /// returns to its previous setting when the last one stops.
+    static func holdMultichannelContent(_ hold: Bool) {
         #if !os(macOS)
         audioSessionQueue.async {
-            if #available(tvOS 15.0, iOS 15.0, *) {
-                try? AVAudioSession.sharedInstance().setSupportsMultichannelContent(supports)
+            guard #available(tvOS 15.0, iOS 15.0, *) else { return }
+            let session = AVAudioSession.sharedInstance()
+            if hold {
+                if multichannelContentHolders == 0 {
+                    multichannelContentBeforeHolders = session.supportsMultichannelContent
+                    try? session.setSupportsMultichannelContent(true)
+                }
+                multichannelContentHolders += 1
+            } else if multichannelContentHolders > 0 {
+                multichannelContentHolders -= 1
+                if multichannelContentHolders == 0 {
+                    try? session.setSupportsMultichannelContent(multichannelContentBeforeHolders)
+                }
             }
         }
         #endif
