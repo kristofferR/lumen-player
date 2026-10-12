@@ -46,5 +46,5 @@ let package = Package(
 
 package.dependencies += [
     .package(path: "FFmpegKit"),
-    .package(url: "https://github.com/kristofferR/SpatialAudioBridge", from: "1.5.0"),
+    .package(url: "https://github.com/kristofferR/SpatialAudioBridge", from: "1.6.1"),
 ]
