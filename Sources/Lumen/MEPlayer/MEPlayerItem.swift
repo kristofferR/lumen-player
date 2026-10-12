@@ -358,7 +358,9 @@ extension MEPlayerItem {
         let audioAssetTrack = audios.first { preferredAudioTrackID == nil ? $0.isEnabled : $0.trackID == preferredAudioTrackID } ?? audios.first { $0.isEnabled } ?? audios.first
         if let audioAssetTrack, let inputAudioStream = formatCtx.pointee.streams[Int(audioAssetTrack.trackID)] {
             let strategy = ProAVAudioStrategy.make(codecpar: audioAssetTrack.codecpar)
-            if session.spatialAudioPolicy.allows(trackID: audioAssetTrack.trackID), let spatialAudio = ProAVSpatialAudioTranscoder(stream: inputAudioStream, session: session) {
+            let spatialAudioPolicy = session.spatialAudioPolicy
+            session.spatialAudioWithheld = !spatialAudioPolicy.isEnabled && !spatialAudioPolicy.refusedTrackIDs.contains(audioAssetTrack.trackID) && ProAVSpatialAudioTranscoder.converts(codecpar: audioAssetTrack.codecpar)
+            if spatialAudioPolicy.allows(trackID: audioAssetTrack.trackID), let spatialAudio = ProAVSpatialAudioTranscoder(stream: inputAudioStream, session: session) {
                 remuxSpatialAudio = spatialAudio
                 audioSignaling = spatialAudio.signaling
             } else if strategy.copiesBitstream {

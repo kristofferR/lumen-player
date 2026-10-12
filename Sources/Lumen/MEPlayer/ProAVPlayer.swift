@@ -35,7 +35,8 @@ public final class ProAVPlayer {
     private var preferredAudioTrackID: Int32?
     /// Audio tracks of this source that the library refused; they keep the FLAC path.
     private var refusedSpatialAudioTrackIDs = Set<Int32>()
-    /// Whether playback resumes after the APAC fallback restarts a launch that was already playing.
+    /// Whether playback resumes after an in-place restart, for the FLAC fallback or AirPlay, of a launch
+    /// that was already playing.
     private var fallbackResumesPlayback: Bool?
     private var playbackTimeObserver: Any?
     private var externalPlaybackObservation: NSKeyValueObservation?
@@ -232,16 +233,23 @@ public final class ProAVPlayer {
         if case let .refused(trackID) = failure {
             refusedSpatialAudioTrackIDs.insert(trackID)
         }
-        restartWithoutSpatialAudio()
+        restartInPlace(spatialAudioEnabled: false)
     }
 
     private func externalPlaybackDidChange(isActive: Bool) {
-        guard isActive, !didFail else { return }
+        guard !didFail else { return }
+        guard isActive else {
+            // Back on this device, a launch that left APAC out for AirPlay brings it back.
+            if session?.spatialAudioWithheld == true {
+                restartInPlace(spatialAudioEnabled: true)
+            }
+            return
+        }
         if session?.playsSpatialAudio == true {
             KSLog(level: .info, "AirPlay started; playing the APAC track through FLAC")
             // Like a seek, the restart abandons a pending switch, which the layer then makes cold,
             // without APAC while AirPlay lasts.
-            restartWithoutSpatialAudio()
+            restartInPlace(spatialAudioEnabled: false)
         } else if let pending = pendingSourceSwitch, pending.spatialAudio.isEnabled {
             var spatialAudio = pending.spatialAudio
             spatialAudio.isEnabled = false
@@ -249,13 +257,13 @@ public final class ProAVPlayer {
         }
     }
 
-    /// Restarts the active launch at the current position on the FLAC path.
-    private func restartWithoutSpatialAudio() {
+    /// Restarts the active launch at the current position, keeping the play or pause state.
+    private func restartInPlace(spatialAudioEnabled: Bool) {
         let seekCompletion = pendingSeekCompletion
         pendingSeekCompletion = nil
         // The remux runs ahead of playback, so this can happen while the launch plays.
         let resumesPlayback = isReadyToPlay && seekCompletion == nil ? isPlaying : nil
-        restart(at: currentPlaybackTime, completion: seekCompletion, spatialAudioEnabled: false)
+        restart(at: currentPlaybackTime, completion: seekCompletion, spatialAudioEnabled: spatialAudioEnabled)
         fallbackResumesPlayback = resumesPlayback
     }
 

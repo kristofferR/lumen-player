@@ -103,6 +103,16 @@ final class ProAVSpatialAudioTranscoder: @unchecked Sendable {
         queue.finish()
     }
 
+    /// Whether a track would convert on this system, given the chance.
+    static func converts(codecpar: AVCodecParameters) -> Bool {
+        #if canImport(SpatialAudioBridge)
+        if #available(macOS 26, iOS 26, tvOS 26, *) {
+            return codec(codecpar: codecpar) != nil
+        }
+        #endif
+        return false
+    }
+
     #if canImport(SpatialAudioBridge)
     @available(macOS 26, iOS 26, tvOS 26, *)
     static func codec(codecpar: AVCodecParameters) -> SpatialAudioCodec? {

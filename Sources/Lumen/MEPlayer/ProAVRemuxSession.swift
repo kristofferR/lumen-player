@@ -45,6 +45,7 @@ public final class ProAVRemuxSession: @unchecked Sendable {
     private var _preferredAudioTrackID: Int32?
     private var _spatialAudioPolicy = SpatialAudioPolicy()
     private var _spatialAudioFailure: SpatialAudioFailure?
+    private var _spatialAudioWithheld = false
     private var _playbackTime: TimeInterval?
     private var _onReady: ((URL) -> Void)?
     private var _onFailure: ((NSError) -> Void)?
@@ -106,6 +107,17 @@ public final class ProAVRemuxSession: @unchecked Sendable {
     /// Set when the session failed because the APAC conversion did; the FLAC path can still play the track.
     var spatialAudioFailure: SpatialAudioFailure? {
         withLock { _spatialAudioFailure }
+    }
+
+    /// Whether this launch left APAC out for an eligible track that its source has not refused, as during
+    /// AirPlay, so a later launch can bring it back.
+    var spatialAudioWithheld: Bool {
+        get {
+            withLock { _spatialAudioWithheld }
+        }
+        set {
+            withLock { _spatialAudioWithheld = newValue }
+        }
     }
 
     /// The player's position from the start of the file, which the remux reads ahead of.
