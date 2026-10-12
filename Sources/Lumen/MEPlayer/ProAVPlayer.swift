@@ -42,13 +42,6 @@ public final class ProAVPlayer {
     private var externalPlaybackObservation: NSKeyValueObservation?
     /// The AtmosOutputActivator while a launch plays APAC on tvOS; releasing it detaches it.
     private var atmosOutput: AnyObject?
-    private var holdsMultichannelContent = false {
-        didSet {
-            if holdsMultichannelContent != oldValue {
-                KSOptions.holdMultichannelContent(holdsMultichannelContent)
-            }
-        }
-    }
     private var reportedReady = false
     private var didFail = false
     public weak var delegate: MediaPlayerDelegate?
@@ -94,13 +87,6 @@ public final class ProAVPlayer {
             }
         }
         #endif
-    }
-
-    deinit {
-        // A player released without a shutdown still gives up its hold.
-        if holdsMultichannelContent {
-            KSOptions.holdMultichannelContent(false)
-        }
     }
 
     private static var workspaceRoot: URL {
@@ -186,14 +172,12 @@ public final class ProAVPlayer {
         innerPlayer.prepareToPlay()
     }
 
-    /// Holds multichannel content while the active launch plays APAC, and on tvOS keeps the receiver
-    /// in Dolby Atmos, which APAC alone does not switch.
+    /// On tvOS keeps the receiver in Dolby Atmos while the active launch plays APAC, which APAC alone
+    /// does not switch.
     private func updateSpatialAudioOutput() {
-        let playsSpatialAudio = session?.playsSpatialAudio == true
-        holdsMultichannelContent = playsSpatialAudio
         #if os(tvOS) && canImport(SpatialAudioPlayback)
         guard #available(tvOS 26, *) else { return }
-        guard playsSpatialAudio else {
+        guard session?.playsSpatialAudio == true else {
             atmosOutput = nil
             return
         }
@@ -202,11 +186,6 @@ public final class ProAVPlayer {
         activator.attach(to: innerPlayer.player)
         atmosOutput = activator
         #endif
-    }
-
-    private func stopSpatialAudioOutput() {
-        atmosOutput = nil
-        holdsMultichannelContent = false
     }
 
     private func applyDisplayCriteria() {
@@ -275,7 +254,7 @@ public final class ProAVPlayer {
         pendingSeekCompletion = nil
         seekCompletion?(false)
         remuxItem?.delegate = nil
-        stopSpatialAudioOutput()
+        atmosOutput = nil
         innerPlayer.shutdown()
         remuxItem?.shutdown()
         session?.requestCleanup()
@@ -520,7 +499,7 @@ extension ProAVPlayer: MediaPlayerProtocol {
         pendingSeekCompletion = nil
         seekCompletion?(false)
         remuxItem?.delegate = nil
-        stopSpatialAudioOutput()
+        atmosOutput = nil
         innerPlayer.shutdown()
         remuxItem?.shutdown()
         session?.requestCleanup()
