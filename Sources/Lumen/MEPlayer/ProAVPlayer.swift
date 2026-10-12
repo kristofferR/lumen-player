@@ -237,14 +237,16 @@ public final class ProAVPlayer {
 
     private func externalPlaybackDidChange(isActive: Bool) {
         guard isActive, !didFail else { return }
-        if let pending = pendingSourceSwitch, pending.spatialAudio.isEnabled {
+        if session?.playsSpatialAudio == true {
+            KSLog(level: .info, "AirPlay started; playing the APAC track through FLAC")
+            // Like a seek, the restart abandons a pending switch, which the layer then makes cold,
+            // without APAC while AirPlay lasts.
+            restartWithoutSpatialAudio()
+        } else if let pending = pendingSourceSwitch, pending.spatialAudio.isEnabled {
             var spatialAudio = pending.spatialAudio
             spatialAudio.isEnabled = false
             restartPendingSourceSwitch(spatialAudio: spatialAudio)
         }
-        guard session?.playsSpatialAudio == true else { return }
-        KSLog(level: .info, "AirPlay started; playing the APAC track through FLAC")
-        restartWithoutSpatialAudio()
     }
 
     /// Restarts the active launch at the current position on the FLAC path.
