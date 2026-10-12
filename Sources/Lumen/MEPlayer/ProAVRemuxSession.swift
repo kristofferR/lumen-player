@@ -118,11 +118,12 @@ public final class ProAVRemuxSession: @unchecked Sendable {
         }
     }
 
-    /// How far the remuxed video runs ahead of playback, once both are known. Video times are the
-    /// source's own, which start at `sourceStart`.
+    /// How far the remuxed video runs ahead of playback, once the session is ready and both are known,
+    /// so the remux always reaches its readiness gate. Video times are the source's own, which start
+    /// at `sourceStart`.
     func remuxedAhead(sourceStart: TimeInterval) -> TimeInterval? {
         withLock {
-            guard let lastVideoSeconds, let _playbackTime else { return nil }
+            guard readyFired, let lastVideoSeconds, let _playbackTime else { return nil }
             return lastVideoSeconds - sourceStart - _playbackTime
         }
     }

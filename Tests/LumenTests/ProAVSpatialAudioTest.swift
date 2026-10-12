@@ -192,12 +192,16 @@ class ProAVSpatialAudioTest: XCTestCase {
         XCTAssertFalse(policy.allows(trackID: 2))
     }
 
-    func testRemuxMeasuresHowFarItReadsAhead() {
+    func testRemuxMeasuresHowFarItReadsAheadOnceReady() {
         let session = makeSession()
+        XCTAssertTrue(session.begin(signaling: video, audioSignaling: nil, bandwidth: 12_000_000, resolution: CGSize(width: 1920, height: 1080), frameRate: 23.976))
         session.trackVideoTime(seconds: 641.4)
-        XCTAssertNil(session.remuxedAhead(sourceStart: 1.4))
         // Playback counts from the start of the file; a transport stream's own times start later.
         session.playbackTime = 600
+        XCTAssertNil(session.remuxedAhead(sourceStart: 1.4))
+        for start in [600.0, 602, 604] {
+            session.closeSegment(nextStartTime: start)
+        }
         XCTAssertEqual(session.remuxedAhead(sourceStart: 1.4) ?? 0, 40, accuracy: 0.001)
     }
 }
