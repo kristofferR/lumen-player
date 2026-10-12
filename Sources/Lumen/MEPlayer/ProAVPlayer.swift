@@ -3,7 +3,7 @@ import Foundation
 #if os(tvOS) || os(xrOS)
 import DisplayCriteria
 #endif
-#if canImport(SpatialAudioPlayback)
+#if os(tvOS) && canImport(SpatialAudioPlayback)
 import SpatialAudioPlayback
 #endif
 #if canImport(UIKit)
@@ -39,11 +39,12 @@ public final class ProAVPlayer {
     private var fallbackResumesPlayback: Bool?
     private var playbackTimeObserver: Any?
     private var externalPlaybackObservation: NSKeyValueObservation?
-    /// The AtmosOutputActivator while a launch plays APAC; releasing it detaches it.
-    private var atmosOutput: AnyObject? {
+    /// The AtmosOutputActivator while a launch plays APAC on tvOS; releasing it detaches it.
+    private var atmosOutput: AnyObject?
+    private var holdsMultichannelContent = false {
         didSet {
-            if (atmosOutput == nil) != (oldValue == nil) {
-                KSOptions.holdMultichannelContent(atmosOutput != nil)
+            if holdsMultichannelContent != oldValue {
+                KSOptions.holdMultichannelContent(holdsMultichannelContent)
             }
         }
     }
@@ -92,6 +93,13 @@ public final class ProAVPlayer {
             }
         }
         #endif
+    }
+
+    deinit {
+        // A player released without a shutdown still gives up its hold.
+        if holdsMultichannelContent {
+            KSOptions.holdMultichannelContent(false)
+        }
     }
 
     private static var workspaceRoot: URL {
@@ -172,16 +180,19 @@ public final class ProAVPlayer {
     private func attach(baseURL: URL, directoryName: String) {
         guard !didFail else { return }
         let masterURL = baseURL.appendingPathComponent(directoryName).appendingPathComponent(ProAVRemuxSession.masterPlaylistName)
-        updateAtmosOutput()
+        updateSpatialAudioOutput()
         innerPlayer.replace(url: masterURL, options: options)
         innerPlayer.prepareToPlay()
     }
 
-    /// Keeps the receiver in Dolby Atmos while the active launch plays APAC, which alone does not switch it.
-    private func updateAtmosOutput() {
-        #if canImport(SpatialAudioPlayback)
-        guard #available(macOS 26, iOS 26, tvOS 26, *) else { return }
-        guard session?.playsSpatialAudio == true else {
+    /// Holds multichannel content while the active launch plays APAC, and on tvOS keeps the receiver
+    /// in Dolby Atmos, which APAC alone does not switch.
+    private func updateSpatialAudioOutput() {
+        let playsSpatialAudio = session?.playsSpatialAudio == true
+        holdsMultichannelContent = playsSpatialAudio
+        #if os(tvOS) && canImport(SpatialAudioPlayback)
+        guard #available(tvOS 26, *) else { return }
+        guard playsSpatialAudio else {
             atmosOutput = nil
             return
         }
@@ -190,6 +201,11 @@ public final class ProAVPlayer {
         activator.attach(to: innerPlayer.player)
         atmosOutput = activator
         #endif
+    }
+
+    private func stopSpatialAudioOutput() {
+        atmosOutput = nil
+        holdsMultichannelContent = false
     }
 
     private func applyDisplayCriteria() {
@@ -220,7 +236,13 @@ public final class ProAVPlayer {
     }
 
     private func externalPlaybackDidChange(isActive: Bool) {
-        guard isActive, !didFail, session?.playsSpatialAudio == true else { return }
+        guard isActive, !didFail else { return }
+        if let pending = pendingSourceSwitch, pending.spatialAudio.isEnabled {
+            var spatialAudio = pending.spatialAudio
+            spatialAudio.isEnabled = false
+            restartPendingSourceSwitch(spatialAudio: spatialAudio)
+        }
+        guard session?.playsSpatialAudio == true else { return }
         KSLog(level: .info, "AirPlay started; playing the APAC track through FLAC")
         restartWithoutSpatialAudio()
     }
@@ -243,7 +265,7 @@ public final class ProAVPlayer {
         pendingSeekCompletion = nil
         seekCompletion?(false)
         remuxItem?.delegate = nil
-        atmosOutput = nil
+        stopSpatialAudioOutput()
         innerPlayer.shutdown()
         remuxItem?.shutdown()
         session?.requestCleanup()
@@ -303,6 +325,11 @@ public final class ProAVPlayer {
         if case let .refused(trackID) = failure {
             spatialAudio.refusedTrackIDs.insert(trackID)
         }
+        restartPendingSourceSwitch(spatialAudio: spatialAudio)
+    }
+
+    private func restartPendingSourceSwitch(spatialAudio: ProAVRemuxSession.SpatialAudioPolicy) {
+        guard let pending = pendingSourceSwitch else { return }
         pendingSourceSwitch = nil
         if pending.innerSwitchStarted {
             innerPlayer.abandonPendingSourceSwitch()
@@ -355,7 +382,7 @@ public final class ProAVPlayer {
         if session?.videoSignaling?.preferredDynamicRange != previousDynamicRange {
             applyDisplayCriteria()
         }
-        updateAtmosOutput()
+        updateSpatialAudioOutput()
         pending.completion(true)
     }
 
@@ -483,7 +510,7 @@ extension ProAVPlayer: MediaPlayerProtocol {
         pendingSeekCompletion = nil
         seekCompletion?(false)
         remuxItem?.delegate = nil
-        atmosOutput = nil
+        stopSpatialAudioOutput()
         innerPlayer.shutdown()
         remuxItem?.shutdown()
         session?.requestCleanup()
