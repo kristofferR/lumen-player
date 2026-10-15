@@ -2,7 +2,7 @@ import AppKit
 import AVFoundation
 import AVKit
 import Foundation
-import Lumen
+@_spi(AirPlayExperiment) import Lumen
 
 private func itemID(_ item: AVPlayerItem?) -> String {
     item.map { String(describing: Unmanaged.passUnretained($0).toOpaque()) } ?? "nil"
@@ -24,10 +24,9 @@ private final class EventLog: @unchecked Sendable {
     }
 
     func emit(_ event: String, player: AVPlayer? = nil, extra: [String: Any] = [:]) {
-        let timestamp = ProcessInfo.processInfo.systemUptime
         var record = extra
         record["event"] = event
-        record["uptime"] = timestamp
+        record["uptime"] = ProcessInfo.processInfo.systemUptime
         record["mainThread"] = Thread.isMainThread
         if let player {
             record["externalVideo"] = player.isExternalPlaybackActive
@@ -38,7 +37,7 @@ private final class EventLog: @unchecked Sendable {
             record["timeControl"] = player.timeControlStatus.rawValue
             record["muted"] = player.isMuted
             let seconds = player.currentTime().seconds
-            if seconds.isFinite { record["seconds"] = seconds }
+            if seconds.isFinite { record["itemSeconds"] = seconds }
         }
         lock.lock()
         defer { lock.unlock() }
@@ -54,45 +53,51 @@ private final class EventLog: @unchecked Sendable {
 
 @MainActor
 private final class ExperimentController: NSObject, NSApplicationDelegate, AVRoutePickerViewDelegate {
+    private struct Configuration: Decodable {
+        let mediaURL: String
+        let audioTrackID: Int32
+    }
     private var window: NSWindow?
-    private var engine: KSAVPlayer?
+    private var engine: ProAVPlayer?
     private var observations = [NSKeyValueObservation]()
-    private var itemStatusObservation: NSKeyValueObservation?
+    private var itemObservation: NSKeyValueObservation?
     private var timeObserver: Any?
-    private var mediaURL: URL?
-    private var options = KSOptions()
     private var log: EventLog?
-    private var candidateReady = false
-    private let stateLabel = NSTextField(labelWithString: "Not prepared")
+    private var prepared = false
+    private var stopped = false
+    private let stateLabel = NSTextField(labelWithString: "Not prepared. No automatic playback.")
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         do {
             log = try EventLog()
-            guard let configPath = ProcessInfo.processInfo.environment["LUMEN_EXPERIMENT_CONFIG"] else {
-                throw NSError(domain: "ExperimentConfig", code: 1)
-            }
-            let data = try Data(contentsOf: URL(fileURLWithPath: configPath))
-            guard let config = try JSONSerialization.jsonObject(with: data) as? [String: String],
-                  let rawURL = config["mediaURL"], let url = URL(string: rawURL)
-            else { throw NSError(domain: "ExperimentConfig", code: 2) }
-            mediaURL = url
+            guard let path = ProcessInfo.processInfo.environment["LUMEN_EXPERIMENT_CONFIG"] else { throw NSError(domain: "ExperimentConfig", code: 1) }
+            let config = try JSONDecoder().decode(Configuration.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
+            guard let url = URL(string: config.mediaURL), url.isFileURL,
+                  FileManager.default.fileExists(atPath: url.path), config.audioTrackID >= 0 else { throw NSError(domain: "ExperimentConfig", code: 2) }
+            let options = KSOptions()
             options.isLoopPlay = false
             options.registerRemoteControll = false
-            let engine = KSAVPlayer(url: url, options: options)
+            options.startPlayTime = 12
+            let engine = ProAVPlayer(url: url, options: options)
             self.engine = engine
             engine.isMuted = true
-            installObservations(player: engine.player)
+            engine.experimentConfigure(audioTrackID: config.audioTrackID) { [weak self] event, fields in
+                guard let self else { return }
+                self.log?.emit(event, player: self.engine?.experimentPlayer, extra: fields)
+                self.stateLabel.stringValue = event
+            }
+            installObservations(player: engine.experimentPlayer)
             buildWindow(engine: engine)
-            log?.emit("setup", player: engine.player, extra: ["os": ProcessInfo.processInfo.operatingSystemVersionString])
+            log?.emit("setup.proav", player: engine.experimentPlayer, extra: ["os": ProcessInfo.processInfo.operatingSystemVersionString, "audioStream": config.audioTrackID, "requestedSourceStart": 12])
         } catch {
             log?.emit("setup.failed", extra: ["domain": (error as NSError).domain, "code": (error as NSError).code])
             NSApplication.shared.terminate(nil)
         }
     }
 
-    private func buildWindow(engine: KSAVPlayer) {
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 680), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-        window.title = "Lumen AirPlay Experiment"
+    private func buildWindow(engine: ProAVPlayer) {
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1050, height: 700), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+        window.title = "Lumen ProAV APAC / FLAC Experiment"
         self.window = window
         let content = NSStackView()
         content.orientation = .vertical
@@ -104,29 +109,30 @@ private final class ExperimentController: NSObject, NSApplicationDelegate, AVRou
             NSLayoutConstraint.activate([content.leadingAnchor.constraint(equalTo: root.leadingAnchor), content.trailingAnchor.constraint(equalTo: root.trailingAnchor), content.topAnchor.constraint(equalTo: root.topAnchor), content.bottomAnchor.constraint(equalTo: root.bottomAnchor)])
         }
         let controls = NSStackView()
-        controls.orientation = .horizontal
-        controls.spacing = 8
         let picker = AVRoutePickerView(frame: NSRect(x: 0, y: 0, width: 40, height: 32))
-        picker.player = engine.player
+        picker.player = engine.experimentPlayer
         picker.delegate = self
         picker.setAccessibilityLabel("External video route")
         controls.addArrangedSubview(picker)
-        addButton("Prepare", action: #selector(prepare), to: controls)
+        addButton("Prepare FLAC baseline", action: #selector(prepare), to: controls)
         addButton("Play", action: #selector(play), to: controls)
         addButton("Pause", action: #selector(pause), to: controls)
         addButton("Stop", action: #selector(stop), to: controls)
-        addButton("Mark route action", action: #selector(mark), to: controls)
+        addButton("Inspect cleanup", action: #selector(inspectCleanup), to: controls)
         content.addArrangedSubview(controls)
-        let paths = NSStackView()
-        paths.orientation = .horizontal
-        paths.spacing = 8
-        addButton("A remove", action: #selector(removeA), to: paths)
-        addButton("A attach", action: #selector(attachA), to: paths)
-        addButton("B prepare", action: #selector(prepareB), to: paths)
-        addButton("B commit", action: #selector(commitB), to: paths)
-        addButton("C direct", action: #selector(replaceC), to: paths)
-        content.addArrangedSubview(paths)
+        let routes = NSStackView()
+        addButton("Mark TV selected", action: #selector(markExternal), to: routes)
+        addButton("Mark local selected", action: #selector(markLocal), to: routes)
+        addButton("Confirm receiver FLAC progression", action: #selector(confirmReceiver), to: routes)
+        content.addArrangedSubview(routes)
+        let handoff = NSStackView()
+        addButton("Prepare APAC", action: #selector(prepareAPAC), to: handoff)
+        addButton("Prepare FLAC", action: #selector(prepareFLAC), to: handoff)
+        addButton("Commit direct", action: #selector(commit), to: handoff)
+        addButton("Cancel candidate", action: #selector(cancel), to: handoff)
+        content.addArrangedSubview(handoff)
         content.addArrangedSubview(stateLabel)
+        content.addArrangedSubview(NSTextField(labelWithString: "Route marks record an observed picker selection; they do not change routes. Confirm actual receiver FLAC playback before codec changes."))
         if let view = engine.view {
             view.translatesAutoresizingMaskIntoConstraints = false
             content.addArrangedSubview(view)
@@ -139,6 +145,8 @@ private final class ExperimentController: NSObject, NSApplicationDelegate, AVRou
     }
 
     private func addButton(_ title: String, action: Selector, to row: NSStackView) {
+        row.orientation = .horizontal
+        row.spacing = 8
         let button = NSButton(title: title, target: self, action: action)
         button.setAccessibilityIdentifier(title)
         row.addArrangedSubview(button)
@@ -146,140 +154,73 @@ private final class ExperimentController: NSObject, NSApplicationDelegate, AVRou
 
     private func installObservations(player: AVPlayer) {
         let eventLog = log
-        observations.append(player.observe(\.isExternalPlaybackActive, options: [.initial, .old, .new]) { [weak self] player, change in
-            var fields: [String: Any] = [:]
+        observations.append(player.observe(\.isExternalPlaybackActive, options: [.initial, .old, .new]) { player, change in
+            var fields = [String: Any]()
             if let old = change.oldValue { fields["old"] = old }
             if let new = change.newValue { fields["new"] = new }
             eventLog?.emit("video.kvo", player: player, extra: fields)
-            Task { @MainActor in self?.refreshState() }
         })
         observations.append(player.observe(\.currentItem, options: [.initial, .old, .new]) { [weak self] player, _ in
             eventLog?.emit("item.kvo", player: player)
             let item = player.currentItem
             Task { @MainActor in self?.observeItem(item) }
         })
-        observations.append(player.observe(\.timeControlStatus, options: [.initial, .old, .new]) { player, _ in
-            eventLog?.emit("timeControl.kvo", player: player)
-        })
-        observations.append(player.observe(\.rate, options: [.initial, .old, .new]) { player, _ in
-            eventLog?.emit("rate.kvo", player: player)
-        })
-        timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 1, preferredTimescale: 600), queue: .main) { _ in
-            eventLog?.emit("playback.tick", player: player)
+        observations.append(player.observe(\.timeControlStatus, options: [.initial, .new]) { player, _ in eventLog?.emit("timeControl.kvo", player: player) })
+        observations.append(player.observe(\.rate, options: [.initial, .new]) { player, _ in eventLog?.emit("rate.kvo", player: player) })
+        timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 1, preferredTimescale: 600), queue: .main) { [weak self] time in
+            MainActor.assumeIsolated {
+                guard let self, let engine = self.engine else { return }
+                engine.experimentObserveProgress()
+                var fields: [String: Any] = ["cleanupWorkspaceExists": engine.experimentWorkspaceExists]
+                if engine.currentPlaybackTime.isFinite { fields["sourceSeconds"] = engine.currentPlaybackTime }
+                if time.seconds.isFinite { fields["observerItemSeconds"] = time.seconds }
+                self.log?.emit("playback.tick", player: engine.experimentPlayer, extra: fields)
+            }
         }
     }
 
     private func observeItem(_ item: AVPlayerItem?) {
         let eventLog = log
-        let player = engine?.player
-        itemStatusObservation = item?.observe(\.status, options: [.initial, .old, .new]) { item, _ in
+        let player = engine?.experimentPlayer
+        itemObservation = item?.observe(\.status, options: [.initial, .new]) { item, _ in
             var fields: [String: Any] = ["observedItem": itemID(item), "observedStatus": item.status.rawValue]
-            if let error = item.error as NSError? {
-                fields["errorDomain"] = error.domain
-                fields["errorCode"] = error.code
-            }
+            if let error = item.error as NSError? { fields["errorDomain"] = error.domain; fields["errorCode"] = error.code }
             eventLog?.emit("itemStatus.kvo", player: player, extra: fields)
         }
-        refreshState()
-    }
-
-    private func refreshState() {
-        guard let player = engine?.player else { return }
-        stateLabel.stringValue = "External video: \(player.isExternalPlaybackActive) | Item: \(itemID(player.currentItem)) | Status: \(player.currentItem?.status.rawValue ?? -1) | Candidate ready: \(candidateReady) | Muted: \(player.isMuted)"
     }
 
     @objc private func prepare() {
+        guard !prepared, !stopped else { return }
+        prepared = true
+        log?.emit("baseline.prepare", player: engine?.experimentPlayer)
+        engine?.experimentBeginBaseline()
+    }
+    @objc private func play() { if !stopped { engine?.play() } }
+    @objc private func pause() { engine?.pause() }
+    @objc private func markExternal() { engine?.experimentMarkSelectedRoute(external: true) }
+    @objc private func markLocal() { engine?.experimentMarkSelectedRoute(external: false) }
+    @objc private func confirmReceiver() { engine?.experimentConfirmReceiverProgress() }
+    @objc private func prepareAPAC() { engine?.experimentPrepareCounterpart(.apac) }
+    @objc private func prepareFLAC() { engine?.experimentPrepareCounterpart(.flac) }
+    @objc private func commit() { engine?.experimentCommitCandidate() }
+    @objc private func cancel() { engine?.experimentCancelCandidate() }
+    @objc private func inspectCleanup() {
         guard let engine else { return }
-        log?.emit("prepare.before", player: engine.player)
-        engine.prepareToPlay()
-        log?.emit("prepare.after", player: engine.player)
+        log?.emit("cleanup.inspected", player: engine.experimentPlayer, extra: ["workspaceExists": engine.experimentWorkspaceExists])
     }
-
-    @objc private func play() { engine?.play(); log?.emit("play", player: engine?.player) }
-    @objc private func pause() { engine?.pause(); log?.emit("pause", player: engine?.player) }
-    @objc private func mark() { log?.emit("manual.routeAction", player: engine?.player) }
-
-    @objc private func removeA() {
-        guard let engine else { return }
-        engine.cancelSourceSwitch()
-        candidateReady = false
-        log?.emit("A.remove.before", player: engine.player)
-        engine.shutdown()
-        log?.emit("A.remove.after.checkpoint", player: engine.player)
-        refreshState()
-    }
-
-    @objc private func attachA() {
-        guard let engine, let mediaURL else { return }
-        log?.emit("A.attach.before", player: engine.player)
-        engine.replace(url: mediaURL, options: options)
-        engine.prepareToPlay()
-        engine.play()
-        log?.emit("A.attach.after", player: engine.player)
-    }
-
-    @objc private func prepareB() {
-        guard let engine, let mediaURL else { return }
-        candidateReady = false
-        engine.experimentSourceSwitchReady = { [weak self] in
-            guard let self else { return }
-            self.candidateReady = true
-            self.log?.emit("B.ready.checkpoint", player: self.engine?.player)
-            self.refreshState()
-        }
-        log?.emit("B.prepare.before", player: engine.player)
-        engine.switchSource(url: mediaURL, options: options) { [weak self] success in
-            guard let self else { return }
-            self.candidateReady = false
-            self.log?.emit("B.complete", player: self.engine?.player, extra: ["success": success])
-            self.refreshState()
-        }
-        log?.emit("B.prepare.after", player: engine.player)
-    }
-
-    @objc private func commitB() {
-        guard let engine, candidateReady else {
-            log?.emit("B.commit.notReady", player: engine?.player)
-            return
-        }
-        log?.emit("B.commit.before", player: engine.player)
-        engine.experimentCommitSourceSwitch()
-        log?.emit("B.commit.after", player: engine.player)
-        refreshState()
-    }
-
-    @objc private func replaceC() {
-        guard let engine, let mediaURL else { return }
-        engine.cancelSourceSwitch()
-        candidateReady = false
-        let replacement = AVPlayerItem(url: mediaURL)
-        log?.emit("C.replace.before", player: engine.player, extra: ["replacementItem": itemID(replacement)])
-        engine.player.replaceCurrentItem(with: replacement)
-        engine.play()
-        log?.emit("C.replace.after", player: engine.player)
-    }
-
     @objc private func stop() {
+        guard !stopped else { return }
+        stopped = true
         engine?.shutdown()
-        log?.emit("stop", player: engine?.player)
-        refreshState()
+        log?.emit("stop", player: engine?.experimentPlayer)
     }
-
-    func routePickerViewWillBeginPresentingRoutes(_ routePickerView: AVRoutePickerView) {
-        log?.emit("picker.open", player: engine?.player)
-    }
-
-    func routePickerViewDidEndPresentingRoutes(_ routePickerView: AVRoutePickerView) {
-        log?.emit("picker.closed", player: engine?.player)
-        refreshState()
-    }
-
+    func routePickerViewWillBeginPresentingRoutes(_ routePickerView: AVRoutePickerView) { log?.emit("picker.open", player: engine?.experimentPlayer) }
+    func routePickerViewDidEndPresentingRoutes(_ routePickerView: AVRoutePickerView) { log?.emit("picker.closed", player: engine?.experimentPlayer) }
     func applicationWillTerminate(_ notification: Notification) {
-        if let timeObserver { engine?.player.removeTimeObserver(timeObserver) }
-        engine?.shutdown()
-        log?.emit("terminate", player: engine?.player)
+        if let timeObserver { engine?.experimentPlayer.removeTimeObserver(timeObserver) }
+        stop()
+        log?.emit("terminate", player: engine?.experimentPlayer)
     }
-
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 }
 

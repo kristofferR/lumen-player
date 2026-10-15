@@ -49,6 +49,43 @@ public final class ProAVPlayer {
     private var didFail = false
     public weak var delegate: MediaPlayerDelegate?
 
+    // Temporary SPI on the isolated experiment branch; nil for every normal player.
+    private var experiment: AirPlayExperiment?
+
+    private final class AirPlayExperiment {
+        let event: (String, [String: Any]) -> Void
+        var candidate: ExperimentCandidate?
+        var retained = [RemuxLaunch]()
+        var mapping: ProAVExperimentMapping?
+        var probingBaseline = false
+        var committing = false
+        var blocked = false
+        var selectedExternal: Bool?
+        var externalFLACVerified = false
+        var progressStart: Double?
+        var progressItem: AVPlayerItem?
+        var baselineTimeout: DispatchWorkItem?
+        var confirmationTimeout: DispatchWorkItem?
+
+        init(event: @escaping (String, [String: Any]) -> Void) { self.event = event }
+    }
+
+    private final class ExperimentCandidate {
+        let launch: RemuxLaunch
+        let options: KSOptions
+        let spatial: Bool
+        let requestedOffset: Double
+        var mapping: ProAVExperimentMapping?
+        var timeout: DispatchWorkItem?
+
+        init(launch: RemuxLaunch, options: KSOptions, spatial: Bool, requestedOffset: Double) {
+            self.launch = launch
+            self.options = options
+            self.spatial = spatial
+            self.requestedOffset = requestedOffset
+        }
+    }
+
     private struct RemuxLaunch {
         let index: Int
         let directoryName: String
@@ -79,7 +116,11 @@ public final class ProAVPlayer {
         playbackTimeObserver = innerPlayer.player.addPeriodicTimeObserver(forInterval: CMTime(value: 1, timescale: 1), queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self else { return }
-                self.session?.playbackTime = self.currentPlaybackTime
+                if let experiment = self.experiment, experiment.committing, let candidate = experiment.candidate, let mapping = candidate.mapping {
+                    candidate.launch.session.playbackTime = mapping.sourceOffset + self.innerPlayer.currentPlaybackTime
+                } else {
+                    self.session?.playbackTime = self.currentPlaybackTime
+                }
             }
         }
         observeExternalPlayback()
@@ -139,7 +180,8 @@ public final class ProAVPlayer {
         session.preferredAudioTrackID = audioTrackID
         var spatialAudio = spatialAudio
         // An AirPlay receiver plays the stream itself, so the APAC rendition is left out.
-        spatialAudio.isExternalPlaybackActive = externalPlaybackActive
+        if experiment == nil { spatialAudio.isExternalPlaybackActive = externalPlaybackActive }
+        session.experimentRecordsMuxSample = experiment != nil
         session.spatialAudioPolicy = spatialAudio
         session.playbackTime = time
         options.startPlayTime = time
@@ -150,7 +192,7 @@ public final class ProAVPlayer {
     }
 
     private func startRemux(at time: TimeInterval, spatialAudioEnabled: Bool = true) {
-        let spatialAudio = ProAVRemuxSession.SpatialAudioPolicy(refusedTrackIDs: refusedSpatialAudioTrackIDs, isEnabled: spatialAudioEnabled)
+        let spatialAudio = ProAVRemuxSession.SpatialAudioPolicy(refusedTrackIDs: refusedSpatialAudioTrackIDs, isEnabled: spatialAudioEnabled, isExternalPlaybackActive: experiment != nil)
         let launch = makeLaunch(url: url, options: options, at: time, audioTrackID: preferredAudioTrackID, spatialAudio: spatialAudio)
         launch.session.onReady = { [weak self, weak session = launch.session, directoryName = launch.directoryName] _ in
             runOnMainThread {
@@ -174,6 +216,27 @@ public final class ProAVPlayer {
 
     private func remuxDidBecomeReady(directoryName: String) {
         guard !didFail else { return }
+        if let experiment, experiment.mapping == nil {
+            guard !experiment.probingBaseline, !experiment.blocked, let session else { return }
+            guard let remuxItem, experimentValidateTrack(remuxItem) else { experimentReject("baseline.trackMismatch"); return }
+            experiment.probingBaseline = true
+            Task { [weak self] in
+                let result = await Task.detached { Result { try session.experimentReadMapping() } }.value
+                guard let self, self.experiment === experiment, self.session === session, !experiment.blocked else { return }
+                switch result {
+                case let .success(mapping):
+                    guard mapping.hasMuxedFLAC else { self.experimentReject("baseline.notFLAC"); return }
+                    experiment.mapping = mapping
+                    experiment.baselineTimeout?.cancel()
+                    experiment.event("baseline.mapping", mapping.fields.mapValues { $0 as Any })
+                    experiment.event("baseline.offset", ["requested": self.startOffset, "measured": mapping.sourceOffset])
+                    self.startOffset = mapping.sourceOffset
+                    self.remuxDidBecomeReady(directoryName: directoryName)
+                case let .failure(error): self.experimentReject("baseline.mapping.failed", error: error)
+                }
+            }
+            return
+        }
         guard !restartForExternalPlaybackIfNeeded() else { return }
         applyDisplayCriteria()
         if let serverBaseURL {
@@ -237,6 +300,7 @@ public final class ProAVPlayer {
     }
 
     private func sessionDidFail(_ session: ProAVRemuxSession, error: NSError) {
+        if experiment != nil { experimentReject("session.failed", error: error); return }
         guard !didFail else { return }
         guard let failure = session.spatialAudioFailure else {
             fail(error: error)
@@ -251,6 +315,10 @@ public final class ProAVPlayer {
 
     private func externalPlaybackDidChange(isActive: Bool) {
         externalPlaybackActive = isActive
+        if let experiment {
+            experiment.event("policy.route.checkpoint", ["externalVideo": isActive, "wouldRestart": session?.needsSpatialAudioRestart(isExternalPlaybackActive: isActive) ?? false])
+            return
+        }
         guard !didFail else { return }
         // The activator stops as AirPlay starts, ahead of the restart without APAC.
         updateSpatialAudioOutput()
@@ -278,6 +346,7 @@ public final class ProAVPlayer {
 
     @discardableResult
     private func restartForExternalPlaybackIfNeeded() -> Bool {
+        if experiment != nil { return false }
         guard let session, session.needsSpatialAudioRestart(isExternalPlaybackActive: externalPlaybackActive) else { return false }
         restartInPlace(spatialAudioEnabled: session.spatialAudioPolicy.isEnabled)
         return true
@@ -294,6 +363,7 @@ public final class ProAVPlayer {
     }
 
     private func fail(error: NSError) {
+        if experiment != nil { experimentReject("playback.failed", error: error); return }
         abortPendingSourceSwitch()
         guard !didFail else { return }
         didFail = true
@@ -453,6 +523,228 @@ public final class ProAVPlayer {
     }
 }
 
+// SPI and implementation below exist only on this durable, unmerged experiment branch.
+@_spi(AirPlayExperiment)
+public enum ProAVExperimentAudio: String {
+    case flac, apac
+}
+
+extension ProAVPlayer {
+    @_spi(AirPlayExperiment) public var experimentPlayer: AVQueuePlayer { innerPlayer.player }
+    @_spi(AirPlayExperiment) public var experimentWorkspaceExists: Bool { FileManager.default.fileExists(atPath: workspaceURL.path) }
+
+    @_spi(AirPlayExperiment) public func experimentConfigure(audioTrackID: Int32, event: @escaping (String, [String: Any]) -> Void) {
+        guard session == nil, experiment == nil else { return }
+        preferredAudioTrackID = audioTrackID
+        experiment = AirPlayExperiment(event: event)
+    }
+
+    @_spi(AirPlayExperiment) public func experimentBeginBaseline() {
+        guard let experiment, session == nil, !experiment.blocked else { return }
+        let timeout = DispatchWorkItem { [weak self] in self?.experimentReject("baseline.preparation.timeout") }
+        experiment.baselineTimeout = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30, execute: timeout)
+        prepareToPlay()
+    }
+
+    @_spi(AirPlayExperiment) public func experimentMarkSelectedRoute(external: Bool) {
+        guard let experiment, !experiment.blocked else { return }
+        experiment.selectedExternal = external
+        experiment.progressStart = nil
+        experiment.progressItem = nil
+        experiment.event("operator.selectedRoute", ["external": external])
+    }
+
+    /// Called by the existing app's periodic observer. This is video-item progression, not an
+    /// audio-route or Atmos detector. The operator separately confirms the receiver picture.
+    @_spi(AirPlayExperiment) public func experimentObserveProgress() {
+        guard let experiment, !experiment.blocked, !experiment.committing,
+              experiment.selectedExternal == true, innerPlayer.isExternalPlaybackActive,
+              experiment.mapping?.hasMuxedFLAC == true, session?.playsSpatialAudio == false,
+              innerPlayer.player.currentItem?.status == .readyToPlay, innerPlayer.player.rate > 0 else {
+            experiment?.progressStart = nil
+            experiment?.progressItem = nil
+            return
+        }
+        let time = innerPlayer.player.currentTime().seconds
+        guard time.isFinite else { return }
+        if experiment.progressItem !== innerPlayer.player.currentItem {
+            experiment.progressItem = innerPlayer.player.currentItem
+            experiment.progressStart = time
+        }
+        experiment.event("preflight.externalFLAC.progress", ["itemTime": time, "advance": time - (experiment.progressStart ?? time)])
+    }
+
+    @_spi(AirPlayExperiment) public func experimentConfirmReceiverProgress() {
+        guard let experiment, !experiment.blocked, experiment.selectedExternal == true,
+              innerPlayer.isExternalPlaybackActive, experiment.progressItem === innerPlayer.player.currentItem,
+              let start = experiment.progressStart, innerPlayer.player.rate > 0,
+              innerPlayer.player.currentTime().seconds - start >= 2,
+              experiment.mapping?.hasMuxedFLAC == true else {
+            experiment?.event("preflight.notSatisfied", [:])
+            return
+        }
+        let item = innerPlayer.player.currentItem
+        experiment.confirmationTimeout?.cancel()
+        let timeout = DispatchWorkItem { [weak self] in self?.experimentReject("preflight.itemMapping.timeout") }
+        experiment.confirmationTimeout = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30, execute: timeout)
+        Task { [weak self] in
+            guard let self else { return }
+            let identity = await self.innerPlayer.experimentValidateItemTimeline(event: experiment.event)
+            guard self.experiment === experiment, !experiment.blocked, self.innerPlayer.player.currentItem === item else { return }
+            experiment.confirmationTimeout?.cancel()
+            guard identity else { self.experimentReject("preflight.itemMappingAmbiguous"); return }
+            guard experiment.selectedExternal == true, self.innerPlayer.isExternalPlaybackActive else { return }
+            experiment.externalFLACVerified = true
+            experiment.event("preflight.externalFLAC.operatorConfirmed", [:])
+        }
+    }
+
+    @_spi(AirPlayExperiment) public func experimentPrepareCounterpart(_ audio: ProAVExperimentAudio) {
+        guard let experiment, !experiment.blocked, experiment.externalFLACVerified,
+              !experiment.committing, experiment.candidate == nil,
+              let active = session, experiment.mapping != nil, serverBaseURL != nil else {
+            experiment?.event("candidate.notPermitted", [:])
+            return
+        }
+        let time = currentPlaybackTime
+        guard time.isFinite, time >= 0 else { experimentReject("position.invalid"); return }
+        let options = KSOptions()
+        options.isLoopPlay = false
+        options.registerRemoteControll = false
+        let policy = ProAVRemuxSession.SpatialAudioPolicy(isExternalPlaybackActive: audio == .flac)
+        let launch = makeLaunch(url: url, options: options, at: time, audioTrackID: preferredAudioTrackID, spatialAudio: policy)
+        let candidate = ExperimentCandidate(launch: launch, options: options, spatial: audio == .apac, requestedOffset: time)
+        experiment.candidate = candidate
+        launch.session.onReady = { [weak self, weak candidate] _ in
+            runOnMainThread {
+                guard let self, let candidate, self.experiment?.candidate === candidate else { return }
+                self.experimentMeasureCandidate(candidate)
+            }
+        }
+        launch.session.onFailure = { [weak self] error in runOnMainThread { self?.experimentReject("candidate.session.failed", error: error) } }
+        let timeout = DispatchWorkItem { [weak self] in self?.experimentReject("candidate.preparation.timeout") }
+        candidate.timeout = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30, execute: timeout)
+        experiment.event("candidate.prepare", ["audio": audio.rawValue, "requestedSourceOffset": time, "activeAPAC": active.playsSpatialAudio, "launch": launch.index])
+        launch.item.prepareToPlay()
+    }
+
+    private func experimentMeasureCandidate(_ candidate: ExperimentCandidate) {
+        guard let experiment, !experiment.blocked, candidate.mapping == nil,
+              experimentValidateTrack(candidate.launch.item),
+              candidate.launch.session.playsSpatialAudio == candidate.spatial else {
+            experimentReject("candidate.codecOrTrackMismatch")
+            return
+        }
+        let candidateSession = candidate.launch.session
+        let spatial = candidate.spatial
+        Task { [weak self] in
+            let result = await Task.detached { () -> Result<ProAVExperimentMapping, Error> in
+                Result {
+                    var mapping = try candidateSession.experimentReadMapping()
+                    if spatial {
+                        let audio = try ProAVExperimentMapping.audioTiming(directory: candidateSession.configuration.directory)
+                        guard audio["audioSampleEntry"] == "apac" else {
+                            throw NSError(domain: "LumenExperimentMapping", code: 12)
+                        }
+                        mapping.fields.merge(audio) { _, value in value }
+                    } else if !mapping.hasMuxedFLAC {
+                        throw NSError(domain: "LumenExperimentMapping", code: 13)
+                    }
+                    return mapping
+                }
+            }.value
+            guard let self, self.experiment === experiment, !experiment.blocked, experiment.candidate === candidate else { return }
+            switch result {
+            case let .success(mapping):
+                candidate.mapping = mapping
+                experiment.event("candidate.mapping", mapping.fields.mapValues { $0 as Any })
+                experiment.event("candidate.ready.checkpoint", ["launch": candidate.launch.index, "audio": candidate.spatial ? "apac" : "flac", "requestedOffset": candidate.requestedOffset, "measuredOffset": mapping.sourceOffset])
+            case let .failure(error): self.experimentReject("candidate.mapping.failed", error: error)
+            }
+        }
+    }
+
+    private func experimentValidateTrack(_ item: MEPlayerItem) -> Bool {
+        guard let selected = item.assetTracks.first(where: { $0.mediaType == .audio && $0.isEnabled }),
+              selected.trackID == preferredAudioTrackID,
+              ProAVSpatialAudioTranscoder.converts(codecpar: selected.codecpar) else { return false }
+        experiment?.event("source.selectedTrack", ["stream": selected.trackID, "codec": selected.codecName, "timebase": "\(selected.timebase.num)/\(selected.timebase.den)"])
+        return true
+    }
+
+    @_spi(AirPlayExperiment) public func experimentCancelCandidate() {
+        guard let experiment, !experiment.committing, let candidate = experiment.candidate else { return }
+        candidate.timeout?.cancel()
+        candidate.launch.session.onReady = nil
+        candidate.launch.session.onFailure = nil
+        candidate.launch.item.delegate = nil
+        candidate.launch.item.shutdown()
+        experiment.retained.append(candidate.launch)
+        experiment.candidate = nil
+        experiment.event("candidate.cancelled.filesRetained", ["launch": candidate.launch.index])
+    }
+
+    @_spi(AirPlayExperiment) public func experimentCommitCandidate() {
+        guard let experiment, !experiment.blocked, !experiment.committing,
+              let candidate = experiment.candidate, let mapping = candidate.mapping,
+              let oldSession = session, let oldItem = remuxItem, let oldProxy = delegateProxy,
+              let selectedExternal = experiment.selectedExternal, let base = serverBaseURL else { return }
+        guard !candidate.spatial || !selectedExternal,
+              selectedExternal == innerPlayer.isExternalPlaybackActive else {
+            experiment.event("candidate.routeMismatch.cancelRequired", [:])
+            return
+        }
+        let position = currentPlaybackTime
+        let target = position - mapping.sourceOffset
+        guard position.isFinite, target.isFinite, target >= 0 else { experimentReject("candidate.mapping.targetInvalid"); return }
+        candidate.timeout?.cancel()
+        experiment.committing = true
+        let old = RemuxLaunch(index: activeLaunchIndex, directoryName: "launch\(activeLaunchIndex)", session: oldSession, item: oldItem, proxy: oldProxy)
+        let master = base.appendingPathComponent(candidate.launch.directoryName).appendingPathComponent(ProAVRemuxSession.masterPlaylistName)
+        experiment.event("candidate.commit", ["sourcePosition": position, "candidateItemTarget": target, "candidateMeasuredOffset": mapping.sourceOffset, "activeMeasuredOffset": startOffset])
+        innerPlayer.experimentReplaceDirect(url: master, options: candidate.options, target: target, event: experiment.event, validateCommit: { [weak self] in
+            guard let self, !experiment.blocked, let route = experiment.selectedExternal else { return false }
+            return route == self.innerPlayer.isExternalPlaybackActive && (!candidate.spatial || !route)
+        }) { [weak self] success in
+            guard let self, self.experiment === experiment else { return }
+            experiment.committing = false
+            guard !experiment.blocked else { return }
+            if !success { self.experimentReject("candidate.direct.failed"); return }
+            self.session = candidate.launch.session
+            self.remuxItem = candidate.launch.item
+            self.delegateProxy = candidate.launch.proxy
+            self.activeLaunchIndex = candidate.launch.index
+            self.options = candidate.options
+            self.startOffset = mapping.sourceOffset
+            experiment.mapping = mapping
+            experiment.candidate = nil
+            candidate.launch.session.onReady = nil
+            candidate.launch.session.onFailure = { [weak self] error in runOnMainThread { self?.experimentReject("active.session.failed", error: error) } }
+            old.item.delegate = nil
+            old.item.shutdown()
+            experiment.retained.append(old)
+            self.session?.playbackTime = self.currentPlaybackTime
+            experiment.event("candidate.committed.oldFilesRetained", ["sourcePositionAfterSeek": self.currentPlaybackTime, "sourcePositionAtCommit": position, "audio": candidate.spatial ? "apac" : "flac"])
+        }
+    }
+
+    private func experimentReject(_ event: String, error: Error? = nil) {
+        guard let experiment, !experiment.blocked else { return }
+        var fields = [String: Any]()
+        if let error = error as NSError? { fields = ["errorDomain": error.domain, "errorCode": error.code] }
+        experiment.event(event, fields)
+        experiment.blocked = true
+        experiment.baselineTimeout?.cancel()
+        experiment.confirmationTimeout?.cancel()
+        innerPlayer.pause()
+        experimentCancelCandidate()
+        experiment.event("experiment.blocked.stopRequired", [:])
+    }
+}
+
 extension ProAVPlayer: MediaPlayerProtocol {
     public var view: UIView? { innerPlayer.view }
     public var playableTime: TimeInterval { startOffset + innerPlayer.playableTime }
@@ -525,6 +817,7 @@ extension ProAVPlayer: MediaPlayerProtocol {
     }
 
     public func play() {
+        if experiment?.blocked == true { return }
         if fallbackResumesPlayback != nil {
             fallbackResumesPlayback = true
         }
@@ -552,6 +845,15 @@ extension ProAVPlayer: MediaPlayerProtocol {
     }
 
     public func shutdown() {
+        if let experiment {
+            experiment.blocked = true
+            experiment.baselineTimeout?.cancel()
+            experiment.confirmationTimeout?.cancel()
+            experiment.progressItem = nil
+            experiment.candidate?.timeout?.cancel()
+            if let candidate = experiment.candidate { experiment.retained.append(candidate.launch) }
+            experiment.candidate = nil
+        }
         abortPendingSourceSwitch()
         let seekCompletion = pendingSeekCompletion
         pendingSeekCompletion = nil
@@ -561,6 +863,11 @@ extension ProAVPlayer: MediaPlayerProtocol {
         updateInnerPlayerItem { innerPlayer.shutdown() }
         remuxItem?.shutdown()
         session?.requestCleanup()
+        if let experiment {
+            experiment.retained.forEach { $0.item.delegate = nil; $0.item.shutdown(); $0.session.requestCleanup() }
+            experiment.retained.removeAll()
+            experiment.event("cleanup.requested", [:])
+        }
         remuxItem = nil
         session = nil
         server.stop()
@@ -602,6 +909,7 @@ extension ProAVPlayer: MediaPlayerProtocol {
 
 extension ProAVPlayer: MediaPlayerDelegate {
     public func readyToPlay(player _: some MediaPlayerProtocol) {
+        if let experiment, experiment.committing { experiment.event("direct.item.ready", [:]); return }
         let seekCompletion = pendingSeekCompletion
         pendingSeekCompletion = nil
         if reportedReady {

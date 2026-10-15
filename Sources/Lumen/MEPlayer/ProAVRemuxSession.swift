@@ -72,6 +72,27 @@ public final class ProAVRemuxSession: @unchecked Sendable {
     private var cleanupWhenFinished = false
     private var ioContext: UnsafeMutablePointer<AVIOContext>?
 
+    // Isolated experiment only. Off by default; no packet bytes are retained.
+    var experimentRecordsMuxSample = false
+    private var experimentMuxSample: ProAVExperimentMuxSample?
+
+    var experimentNeedsMuxSample: Bool {
+        withLock { experimentRecordsMuxSample && experimentMuxSample == nil }
+    }
+
+    func experimentRecordSuccessfulMux(_ sample: ProAVExperimentMuxSample) {
+        withLock {
+            if experimentRecordsMuxSample, experimentMuxSample == nil { experimentMuxSample = sample }
+        }
+    }
+
+    func experimentReadMapping() throws -> ProAVExperimentMapping {
+        guard let sample = withLock({ experimentMuxSample }) else {
+            throw NSError(domain: "LumenExperimentMapping", code: 9)
+        }
+        return try ProAVExperimentMapping.read(directory: configuration.directory, sample: sample)
+    }
+
     public init(configuration: Configuration) {
         self.configuration = configuration
     }

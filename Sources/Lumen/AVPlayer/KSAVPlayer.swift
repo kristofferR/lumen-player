@@ -99,6 +99,150 @@ public class KSAVPlayer {
     public func experimentCommitSourceSwitch() {
         commitPendingSourceSwitch()
     }
+
+    private struct ExperimentRetainedItem {
+        let item: AVPlayerItem
+        let asset: AVURLAsset
+        let loader: DiskCacheResourceLoader?
+        let options: KSOptions
+        let time: CMTime
+    }
+
+    private final class ExperimentDirectHandoff {
+        let previous: ExperimentRetainedItem
+        let candidate: AVPlayerItem
+        let target: Double
+        let resumes: Bool
+        let event: (String, [String: Any]) -> Void
+        let completion: (Bool) -> Void
+        let validateCommit: () -> Bool
+        var observations = [NSKeyValueObservation]()
+        var timeout: DispatchWorkItem?
+        var seeking = false
+
+        init(previous: ExperimentRetainedItem, candidate: AVPlayerItem, target: Double, resumes: Bool, event: @escaping (String, [String: Any]) -> Void, validateCommit: @escaping () -> Bool, completion: @escaping (Bool) -> Void) {
+            self.previous = previous
+            self.candidate = candidate
+            self.target = target
+            self.resumes = resumes
+            self.event = event
+            self.completion = completion
+            self.validateCommit = validateCommit
+        }
+    }
+
+    private var experimentDirectHandoff: ExperimentDirectHandoff?
+    private var experimentRetainedItems = [ExperimentRetainedItem]()
+
+    // Isolated experiment only. Uses the same asset factory and item observers, with no nil item.
+    func experimentReplaceDirect(url: URL, options: KSOptions, target: Double, event: @escaping (String, [String: Any]) -> Void, validateCommit: @escaping () -> Bool, completion: @escaping (Bool) -> Void) {
+        guard experimentDirectHandoff == nil, !options.isLoopPlay, playerLooper == nil,
+              let current = player.currentItem, target.isFinite, target >= 0 else { completion(false); return }
+        let previous = ExperimentRetainedItem(item: current, asset: urlAsset, loader: cacheResourceLoader, options: self.options, time: player.currentTime())
+        let (asset, loader) = Self.makeAsset(url: url, options: options)
+        let candidate = AVPlayerItem(asset: asset)
+        candidate.preferredForwardBufferDuration = options.preferredForwardBufferDuration
+        let handoff = ExperimentDirectHandoff(previous: previous, candidate: candidate, target: target, resumes: isPlaying, event: event, validateCommit: validateCommit, completion: completion)
+        experimentDirectHandoff = handoff
+        pause()
+        urlAsset = asset
+        cacheResourceLoader = loader
+        self.options = options
+        isReadyToPlay = false
+        loadState = .idle
+        shouldSeekTo = 0
+        handoff.observations = [candidate.observe(\.status, options: [.new]) { [weak self] _, _ in
+            runOnMainThread { self?.experimentAdvanceDirectHandoff() }
+        }, candidate.observe(\.seekableTimeRanges, options: [.new]) { [weak self] _, _ in
+            runOnMainThread { self?.experimentAdvanceDirectHandoff() }
+        }]
+        let timeout = DispatchWorkItem { [weak self] in self?.experimentFinishDirectHandoff(success: false) }
+        handoff.timeout = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30, execute: timeout)
+        event("direct.replace.before", ["target": target])
+        player.replaceCurrentItem(with: candidate)
+        event("direct.replace.after", [:])
+        experimentAdvanceDirectHandoff()
+    }
+
+    private func experimentAdvanceDirectHandoff() {
+        guard let handoff = experimentDirectHandoff else { return }
+        if handoff.candidate.status == .failed { experimentFinishDirectHandoff(success: false); return }
+        guard !handoff.seeking else { return }
+        let item = handoff.candidate
+        let ranges = item.seekableTimeRanges.map { $0.timeRangeValue }.filter { $0.start.seconds.isFinite && $0.duration.seconds.isFinite }
+        handoff.event("direct.readiness", ["status": item.status.rawValue, "seekRanges": ranges.map { ["start": $0.start.seconds, "duration": $0.duration.seconds] }])
+        if item.status == .failed { experimentFinishDirectHandoff(success: false); return }
+        guard item.status == .readyToPlay else { return }
+        guard item.tracks.map({ AVMediaPlayerTrack(track: $0) }).contains(where: { $0.mediaType == .video && $0.isPlayable }) else {
+            experimentFinishDirectHandoff(success: false)
+            return
+        }
+        let target = CMTime(seconds: handoff.target, preferredTimescale: 60000)
+        guard ranges.contains(where: { CMTimeRangeContainsTime($0, time: target) }) else { return }
+        handoff.seeking = true
+        Task { [weak self, weak handoff] in
+            guard let self, let handoff else { return }
+            let identity = await self.experimentValidateItemTimeline(event: handoff.event)
+            guard self.experimentDirectHandoff === handoff else { return }
+            guard identity else { self.experimentFinishDirectHandoff(success: false); return }
+            self.player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak handoff] finished in
+                runOnMainThread {
+                    guard let self, let handoff, self.experimentDirectHandoff === handoff else { return }
+                    let actual = self.player.currentTime().seconds
+                    let matches = finished && actual.isFinite && abs(actual - handoff.target) <= 0.001 && handoff.validateCommit()
+                    handoff.event("direct.seek.complete", ["finished": finished, "actual": actual.isFinite ? actual : -1, "target": handoff.target, "mappingMatches": matches])
+                    self.experimentFinishDirectHandoff(success: matches)
+                }
+            }
+        }
+    }
+
+    /// Fragment timestamps alone do not establish AVPlayer's item clock. Require an explicit
+    /// identity source-to-track mapping; absent, scaled or shifted evidence stops this experiment.
+    func experimentValidateItemTimeline(event: (String, [String: Any]) -> Void) async -> Bool {
+        guard #available(macOS 13, iOS 16, tvOS 16, *), let item = player.currentItem,
+              let track = item.tracks.compactMap({ $0.assetTrack }).first(where: { $0.mediaType == .video }),
+              let segments = try? await track.load(.segments), player.currentItem === item,
+              !segments.isEmpty else { event("item.mapping.unavailable", [:]); return false }
+        var identity = true
+        for segment in segments {
+            let mapping = segment.timeMapping
+            let source = mapping.source
+            let target = mapping.target
+            let values = [source.start.seconds, source.duration.seconds, target.start.seconds, target.duration.seconds]
+            guard !segment.isEmpty, values.allSatisfy({ $0.isFinite }), source.duration.seconds > 0 else { identity = false; continue }
+            event("item.mapping.segment", ["sourceStart": source.start.seconds, "sourceDuration": source.duration.seconds, "targetStart": target.start.seconds, "targetDuration": target.duration.seconds])
+            if abs(source.start.seconds - target.start.seconds) > 0.001 || abs(source.duration.seconds - target.duration.seconds) > 0.001 { identity = false }
+        }
+        event("item.mapping.identity", ["confirmed": identity])
+        return identity
+    }
+
+    private func experimentFinishDirectHandoff(success: Bool) {
+        guard let handoff = experimentDirectHandoff else { return }
+        experimentDirectHandoff = nil
+        handoff.timeout?.cancel()
+        handoff.observations.forEach { $0.invalidate() }
+        if success {
+            experimentRetainedItems.append(handoff.previous)
+        } else {
+            let rejectedAsset = urlAsset
+            let rejectedLoader = cacheResourceLoader
+            urlAsset = handoff.previous.asset
+            cacheResourceLoader = handoff.previous.loader
+            options = handoff.previous.options
+            player.replaceCurrentItem(with: handoff.previous.item)
+            player.seek(to: handoff.previous.time, toleranceBefore: .zero, toleranceAfter: .zero)
+            updateStatus(item: handoff.previous.item)
+            loadState = handoff.previous.item.isPlaybackLikelyToKeepUp ? .playable : .loading
+            rejectedAsset.cancelLoading()
+            rejectedLoader?.close()
+        }
+        if success, handoff.resumes { play() }
+        handoff.event(success ? "direct.success" : "direct.rejected.restored", [:])
+        handoff.completion(success)
+    }
     private struct PendingSourceSwitch {
         let item: AVPlayerItem
         let asset: AVURLAsset
@@ -302,7 +446,7 @@ extension KSAVPlayer {
             fileSize = Double(estimatedDataRates.reduce(0, +)) * duration / 8
             embedSubtitleDataSouce.load(playerItem: item)
             isReadyToPlay = true
-        } else if item.status == .failed {
+        } else if item.status == .failed, experimentDirectHandoff == nil {
             error = item.error
         }
     }
@@ -473,6 +617,7 @@ extension KSAVPlayer: MediaPlayerProtocol {
     }
 
     public func shutdown() {
+        experimentFinishDirectHandoff(success: false)
         KSLog("shutdown \(self)")
         abandonPendingSourceSwitch()
         isReadyToPlay = false
@@ -480,6 +625,8 @@ extension KSAVPlayer: MediaPlayerProtocol {
         loadState = .idle
         urlAsset.cancelLoading()
         replaceCurrentItem(playerItem: nil)
+        experimentRetainedItems.forEach { $0.asset.cancelLoading(); $0.loader?.close() }
+        experimentRetainedItems.removeAll()
     }
 
     public func replace(url: URL, options: KSOptions) {

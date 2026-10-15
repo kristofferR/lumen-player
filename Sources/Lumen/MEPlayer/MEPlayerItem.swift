@@ -519,7 +519,20 @@ extension MEPlayerItem {
         {
             remuxSpatialAudio.begin(origin: timeline.origin, videoStart: timeline.videoStart)
         }
+        var experimentSample: ProAVExperimentMuxSample?
+        if outputStream.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_VIDEO,
+           session.experimentNeedsMuxSample, let digest = ProAVExperimentMuxSample.digest(outputPacket)
+        {
+            experimentSample = ProAVExperimentMuxSample(
+                sourceStream: corePacket.pointee.stream_index, outputStream: outputPacket.pointee.stream_index,
+                codec: outputStream.pointee.codecpar.pointee.codec_id,
+                sourcePTS: corePacket.pointee.pts, sourceDTS: corePacket.pointee.dts, sourceTimebase: Timebase(inputStream.pointee.time_base),
+                muxPTS: outputPacket.pointee.pts, muxDTS: outputPacket.pointee.dts, muxTimebase: Timebase(outputStream.pointee.time_base),
+                sourceStart: startTime.seconds, digest: digest
+            )
+        }
         let ret = av_write_frame(outputFormatCtx, outputPacket)
+        if ret >= 0, let experimentSample { session.experimentRecordSuccessfulMux(experimentSample) }
         if ret < 0 {
             KSLog("ProAV remux can not av_write_frame")
         } else if !remuxStreamsRequiringParsedHeader.contains(outputIndex) || Self.startsWithAC3Syncword(packet: corePacket) {
