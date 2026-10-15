@@ -17,20 +17,39 @@ jobs:
     timeout-minutes: 45
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      CANDIDATE_SHA: 16eab0e2567f0e20a8b96d9e765ef8253365dd97
+      EXPECTED_SAB_VERSION: 1.6.2
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
           persist-credentials: false
+          fetch-depth: 0
+      - name: Verify exact candidate
+        run: |
+          test "$GITHUB_SHA" = "$(git rev-parse HEAD)"
+          test "$(git rev-parse origin/review/spatial-audio-route-pacing)" = "$CANDIDATE_SHA"
+          git merge-base --is-ancestor "$CANDIDATE_SHA" HEAD
+          git diff --exit-code "$CANDIDATE_SHA" HEAD -- . ':(exclude).github/workflows/build.yml'
       - name: Check Xcode
         run: |
           xcodebuild -version
+          test "$(xcodebuild -version | head -n 1)" = "Xcode 26.6"
           swift --version
       - name: Build macOS
         run: swift build --arch arm64
+      - name: Verify resolved SpatialAudioBridge
+        run: |
+          jq -e '[.pins[] | select(.identity == "spatialaudiobridge")] as $pins | ($pins | length) == 1 and $pins[0].state.version == env.EXPECTED_SAB_VERSION' Package.resolved
+          jq '.pins[] | select(.identity == "spatialaudiobridge") | {identity, location, state}' Package.resolved
+          shasum -a 256 Package.resolved > "$RUNNER_TEMP/lumen-package-resolved.sha256"
       - name: Test macOS
         run: swift test --arch arm64
       - name: Build iOS Simulator
         run: swift build --scratch-path .build-ios --sdk "$(xcrun --sdk iphonesimulator --show-sdk-path)" --triple arm64-apple-ios13.0-simulator
       - name: Build tvOS Simulator
         run: swift build --scratch-path .build-tvos --sdk "$(xcrun --sdk appletvsimulator --show-sdk-path)" --triple arm64-apple-tvos13.0-simulator
+      - name: Verify dependency lock stayed fixed
+        run: |
+          shasum -a 256 -c "$RUNNER_TEMP/lumen-package-resolved.sha256"
+          git diff --exit-code
