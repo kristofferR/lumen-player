@@ -283,18 +283,22 @@ class ProAVSpatialAudioTest: XCTestCase {
         stream.pointee.time_base = AVRational(num: 1, den: 1000)
         stream.pointee.start_time = 1000
         stream.pointee.duration = 5000
-        XCTAssertEqual(MEPlayerItem.audioEndTime(stream: stream.pointee, sourceStart: 10), 6)
+        XCTAssertEqual(MEPlayerItem.audioEndTime(stream: stream.pointee, sourceStart: 10, formatName: "matroska,webm"), 6)
         stream.pointee.start_time = Int64.min
-        XCTAssertEqual(MEPlayerItem.audioEndTime(stream: stream.pointee, sourceStart: 10), 15)
+        XCTAssertEqual(MEPlayerItem.audioEndTime(stream: stream.pointee, sourceStart: 10, formatName: "matroska,webm"), 15)
         XCTAssertEqual(av_dict_set(&stream.pointee.metadata, "DURATION", "00:00:03.250000000", 0), 0)
         // Matroska stores an absolute end timestamp, not a duration to add to start_time.
-        XCTAssertEqual(MEPlayerItem.audioEndTime(stream: stream.pointee, sourceStart: 10), 3.25)
-        XCTAssertEqual(av_dict_set(&stream.pointee.metadata, "DURATION", "unknown", 0), 0)
-        XCTAssertEqual(MEPlayerItem.audioEndTime(stream: stream.pointee, sourceStart: 10), 15)
-        XCTAssertEqual(av_dict_set(&stream.pointee.metadata, "DURATION", "bad:00:00:03.250", 0), 0)
-        XCTAssertEqual(MEPlayerItem.audioEndTime(stream: stream.pointee, sourceStart: 10), 15)
+        XCTAssertEqual(MEPlayerItem.audioEndTime(stream: stream.pointee, sourceStart: 10, formatName: "matroska,webm"), 3.25)
+        XCTAssertEqual(MEPlayerItem.audioEndTime(stream: stream.pointee, sourceStart: 10, formatName: "mov,mp4,m4a,3gp,3g2,mj2"), 15)
         stream.pointee.duration = Int64.min
-        XCTAssertNil(MEPlayerItem.audioEndTime(stream: stream.pointee, sourceStart: 10))
+        XCTAssertNil(MEPlayerItem.audioEndTime(stream: stream.pointee, sourceStart: 10, formatName: "mpegts"))
+        stream.pointee.duration = 5000
+        XCTAssertEqual(av_dict_set(&stream.pointee.metadata, "DURATION", "unknown", 0), 0)
+        XCTAssertEqual(MEPlayerItem.audioEndTime(stream: stream.pointee, sourceStart: 10, formatName: "matroska,webm"), 15)
+        XCTAssertEqual(av_dict_set(&stream.pointee.metadata, "DURATION", "bad:00:00:03.250", 0), 0)
+        XCTAssertEqual(MEPlayerItem.audioEndTime(stream: stream.pointee, sourceStart: 10, formatName: "matroska,webm"), 15)
+        stream.pointee.duration = Int64.min
+        XCTAssertNil(MEPlayerItem.audioEndTime(stream: stream.pointee, sourceStart: 10, formatName: "matroska,webm"))
     }
 
     func testRemuxMeasuresHowFarItReadsAheadOnceReady() {

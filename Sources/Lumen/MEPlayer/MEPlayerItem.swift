@@ -389,7 +389,7 @@ extension MEPlayerItem {
                 KSLog("ProAV audio track skipped: flac transcode unavailable")
             }
             if streamMapping[Int(audioAssetTrack.trackID)] != nil || remuxSpatialAudio != nil {
-                remuxAudioEndTime = Self.audioEndTime(stream: inputAudioStream.pointee, sourceStart: startTime.seconds)
+                remuxAudioEndTime = Self.audioEndTime(stream: inputAudioStream.pointee, sourceStart: startTime.seconds, formatName: options.formatName)
                 audios.forEach { $0.isEnabled = $0.trackID == audioAssetTrack.trackID }
             }
         }
@@ -536,8 +536,10 @@ extension MEPlayerItem {
     }
 
     /// Matroska's DURATION tag is the track's final timestamp, including the last packet's duration.
-    static func audioEndTime(stream: AVStream, sourceStart: TimeInterval) -> TimeInterval? {
-        if let tag = toDictionary(stream.metadata)["DURATION"] {
+    static func audioEndTime(stream: AVStream, sourceStart: TimeInterval, formatName: String) -> TimeInterval? {
+        if formatName.split(separator: ",").contains(where: { $0 == "matroska" || $0 == "webm" }),
+           let tag = toDictionary(stream.metadata)["DURATION"]
+        {
             let parts = tag.split(separator: ":", omittingEmptySubsequences: false)
             if parts.count == 3, let hours = Double(parts[0]), let minutes = Double(parts[1]), let seconds = Double(parts[2]),
                hours >= 0, minutes >= 0, minutes < 60, seconds >= 0, seconds < 60
