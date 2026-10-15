@@ -17,7 +17,7 @@ jobs:
     timeout-minutes: 45
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
-      CANDIDATE_SHA: 16eab0e2567f0e20a8b96d9e765ef8253365dd97
+      CANDIDATE_SHA: d0688e0e45de4621ed7e9f3b52b0c5dc72dc708f
       EXPECTED_SAB_VERSION: 1.6.2
     steps:
       - uses: actions/checkout@v4
