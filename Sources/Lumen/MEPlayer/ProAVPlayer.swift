@@ -104,12 +104,20 @@ public final class ProAVPlayer {
         var innerSwitchStarted = false
     }
 
-    public required init(url: URL, options: KSOptions) {
+    public required convenience init(url: URL, options: KSOptions) {
+        self.init(url: url, options: options, purgeWorkspaces: true)
+    }
+
+    @_spi(AirPlayExperiment) public convenience init(experimentURL: URL, options: KSOptions) {
+        self.init(url: experimentURL, options: options, purgeWorkspaces: false)
+    }
+
+    private init(url: URL, options: KSOptions, purgeWorkspaces: Bool) {
         self.url = url
         self.options = options
         server = ProAVPlayer.serverFactory()
         innerPlayer = KSAVPlayer(url: url, options: options)
-        ProAVPlayer.purgeWorkspaces()
+        if purgeWorkspaces { ProAVPlayer.purgeWorkspaces() }
         workspaceURL = ProAVPlayer.workspaceRoot.appendingPathComponent(UUID().uuidString)
         innerPlayer.delegate = self
         // The remux reads only so far ahead of this position.

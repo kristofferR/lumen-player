@@ -78,7 +78,7 @@ private final class ExperimentController: NSObject, NSApplicationDelegate, AVRou
             options.isLoopPlay = false
             options.registerRemoteControll = false
             options.startPlayTime = 12
-            let engine = ProAVPlayer(url: url, options: options)
+            let engine = ProAVPlayer(experimentURL: url, options: options)
             self.engine = engine
             engine.isMuted = true
             engine.experimentConfigure(audioTrackID: config.audioTrackID) { [weak self] event, fields in

@@ -4,7 +4,7 @@ This branch is a temporary macOS harness, not a production fix. Do not merge it 
 
 ## What is implemented
 
-One actual `ProAVPlayer` uses its existing `KSAVPlayer` / AVQueuePlayer view, local server, `MEPlayerItem`, remux sessions, APAC converter and FLAC converter. Experiment SPI opts in before preparation. All normal players leave it off. The disabled diagnostic path performs no file reads, demuxing, payload hashing or packet retention and does not change mux input or output. The HLS server remains bound to `127.0.0.1`.
+One actual `ProAVPlayer` uses its existing `KSAVPlayer` / AVQueuePlayer view, local server, `MEPlayerItem`, remux sessions, APAC converter and FLAC converter. Its temporary SPI initializer skips the normal global workspace purge; the harness cleans up only its own workspace. Experiment SPI opts in before preparation. All normal players leave it off and retain their existing initialization. The disabled diagnostic path performs no file reads, demuxing, payload hashing or packet retention and does not change mux input or output. The HLS server remains bound to `127.0.0.1`.
 
 The initial launch is real FLAC HLS at a requested nonzero source position (12 seconds), using an explicitly selected eligible audio stream. No media is opened until **Prepare FLAC baseline**. No automatic play, route change or codec handoff occurs. The player starts muted. The native A/B/C controls are absent; their evidence is reused, not repeated.
 
