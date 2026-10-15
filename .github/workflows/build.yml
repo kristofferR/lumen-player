@@ -1,31 +1,101 @@
-name: build
+name: Lumen example fork validation
 
 on:
-  push:
-    branches:
-      - '*'
-  pull_request:
-    branches:
-      - '*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lumen-example-fork-validation
+  cancel-in-progress: false
 
 jobs:
-  build:
-    name: build
-    runs-on: macos-latest
+  validate:
+    if: github.repository == 'kristofferR/lumen-player' && github.event_name == 'workflow_dispatch'
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      CANDIDATE_SHA: 9a723cc1b2b5304636ef27dac9c196d06834a9a0
+      CANDIDATE_TREE: 3b771c2ad021c0a9c3e58ba8c57af5013f9924d4
+      LIBRARY_SHA: f5f0f6121666ff9571f527d29f10d8ccc8dd68cb
+      EXAMPLES_TREE: 7316d25dda06d7e7abb0845e60bd39c538e0216a
+      EXPECTED_SAB_VERSION: 1.6.2
+      EXPECTED_SAB_REVISION: 14275b11c510596c0f3a361e5da70cec109e99be
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - name: Set up Xcode
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Verify candidate and library equivalence
         run: |
-          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          set -euo pipefail
+          test "$GITHUB_SHA" = "$(git rev-parse HEAD)"
+          test "$(git rev-parse origin/feat/lumen-player-example)" = "$CANDIDATE_SHA"
+          test "$(git rev-parse "$CANDIDATE_SHA^{tree}")" = "$CANDIDATE_TREE"
+          test "$(git show -s --format=%P "$CANDIDATE_SHA")" = "37000ef48c2bc6c7f45e5f020a8b6b9467fcf2d6 $LIBRARY_SHA"
+          test "$(git rev-parse "$CANDIDATE_SHA:Examples")" = "$EXAMPLES_TREE"
+          git merge-base --is-ancestor "$CANDIDATE_SHA" HEAD
+          test "$(git diff --name-only "$CANDIDATE_SHA" HEAD)" = '.github/workflows/build.yml'
+          git diff --exit-code "$CANDIDATE_SHA" HEAD -- . ':(exclude).github/workflows/build.yml'
+          git diff --exit-code "$LIBRARY_SHA" "$CANDIDATE_SHA" -- . ':(exclude)Examples'
+      - name: Check Xcode
+        run: |
+          set -euo pipefail
           xcodebuild -version
+          test "$(xcodebuild -version | head -n 1)" = 'Xcode 26.6'
           swift --version
-      - name: Build macOS
-        run: swift build
-      - name: Build iOS
-        run: swift build --sdk `xcrun -sdk iphonesimulator -show-sdk-path` -Xswiftc -target -Xswiftc arm64-apple-ios13.0-simulator
-      - name: Build tvOS
-        run: swift build --sdk `xcrun -sdk appletvsimulator -show-sdk-path` -Xswiftc -target -Xswiftc arm64-apple-tvos13.0-simulator
-      - name: Test
-        run: swift test -v
+      - name: Prepare pinned XcodeGen
+        run: |
+          set -euo pipefail
+          curl --fail --location --silent --show-error \
+            'https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip' \
+            --output "$RUNNER_TEMP/xcodegen.zip"
+          printf '%s  %s\n' '4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806' "$RUNNER_TEMP/xcodegen.zip" > "$RUNNER_TEMP/xcodegen.sha256"
+          shasum -a 256 -c "$RUNNER_TEMP/xcodegen.sha256"
+          unzip -q "$RUNNER_TEMP/xcodegen.zip" -d "$RUNNER_TEMP/xcodegen-tool"
+          test "$("$RUNNER_TEMP/xcodegen-tool/xcodegen/bin/xcodegen" --version)" = 'Version: 2.46.0'
+      - name: Generate example project
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/xcodegen-tool/xcodegen/bin/xcodegen" generate --spec "$GITHUB_WORKSPACE/Examples/LumenPlayer/project.yml"
+          plutil -convert json -o "$RUNNER_TEMP/lumen-project.json" "$GITHUB_WORKSPACE/Examples/LumenPlayer/LumenPlayer.xcodeproj/project.pbxproj"
+          jq -e 'any(.objects[]; .isa == "XCLocalSwiftPackageReference" and .relativePath == "../..")' "$RUNNER_TEMP/lumen-project.json"
+      - name: Resolve and freeze app dependency lock
+        run: |
+          set -euo pipefail
+          xcodebuild -resolvePackageDependencies \
+            -project "$GITHUB_WORKSPACE/Examples/LumenPlayer/LumenPlayer.xcodeproj" \
+            -scheme LumenPlayer -destination 'generic/platform=tvOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/lumen-example-derived-data" \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/lumen-example-packages" \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=
+          lock="$GITHUB_WORKSPACE/Examples/LumenPlayer/LumenPlayer.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
+          test -f "$lock"
+          jq -e '[.pins[] | select(.identity == "spatialaudiobridge")] as $pins | ($pins | length) == 1 and $pins[0].location == "https://github.com/kristofferR/SpatialAudioBridge" and $pins[0].state.version == env.EXPECTED_SAB_VERSION and $pins[0].state.revision == env.EXPECTED_SAB_REVISION' "$lock"
+          jq '.pins[] | {identity, location, state}' "$lock"
+          shasum -a 256 "$lock" > "$RUNNER_TEMP/lumen-example-lock.sha256"
+      - name: Build unsigned arm64 tvOS Simulator app
+        run: |
+          set -euo pipefail
+          xcodebuild -project "$GITHUB_WORKSPACE/Examples/LumenPlayer/LumenPlayer.xcodeproj" \
+            -scheme LumenPlayer -configuration Debug \
+            -destination 'generic/platform=tvOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/lumen-example-derived-data" \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/lumen-example-packages" \
+            -disableAutomaticPackageResolution \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= build
+      - name: Verify app and unchanged lock and sources
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/lumen-example-derived-data/Build/Products/Debug-appletvsimulator/LumenPlayer.app"
+          test -f "$app/LumenPlayer"
+          test "$(lipo -archs "$app/LumenPlayer")" = arm64
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleSupportedPlatforms:0' "$app/Info.plist")" = AppleTVSimulator
+          shasum -a 256 -c "$RUNNER_TEMP/lumen-example-lock.sha256"
+          git diff --exit-code
+          git diff --cached --exit-code
