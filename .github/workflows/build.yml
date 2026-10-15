@@ -1,31 +1,95 @@
-name: build
+name: Lumen macOS AirPlay experiment
 
 on:
-  push:
-    branches:
-      - '*'
-  pull_request:
-    branches:
-      - '*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lumen-airplay-experiment
+  cancel-in-progress: false
 
 jobs:
   build:
-    name: build
-    runs-on: macos-latest
+    if: github.repository == 'kristofferR/lumen-player' && github.event_name == 'workflow_dispatch'
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      CANDIDATE_SHA: 566c70d00c2fea7a14af81d404f82c231278aab4
+      CANDIDATE_TREE: 21aaf91bff578468301a15279283ec84207b4c63
+      BASE_SHA: 9a723cc1b2b5304636ef27dac9c196d06834a9a0
+      EXPECTED_SAB_VERSION: 1.6.2
+      EXPECTED_SAB_REVISION: 14275b11c510596c0f3a361e5da70cec109e99be
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - name: Set up Xcode
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Verify isolated experiment source
         run: |
-          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          set -euo pipefail
+          test "$GITHUB_SHA" = "$(git rev-parse HEAD)"
+          test "$(git rev-parse origin/experiment/airplay-handoff-20261015)" = "$CANDIDATE_SHA"
+          test "$(git rev-parse "$CANDIDATE_SHA^{tree}")" = "$CANDIDATE_TREE"
+          git merge-base --is-ancestor "$CANDIDATE_SHA" HEAD
+          test "$(git diff --name-only "$CANDIDATE_SHA" HEAD)" = '.github/workflows/build.yml'
+          git diff --exit-code "$CANDIDATE_SHA" HEAD -- . ':(exclude).github/workflows/build.yml'
+          git diff --exit-code "$BASE_SHA" "$CANDIDATE_SHA" -- . ':(exclude)Experiments/AirPlayHandoff' ':(exclude)Sources/Lumen/AVPlayer/KSAVPlayer.swift'
+          git diff "$BASE_SHA" "$CANDIDATE_SHA" -- Sources/Lumen/AVPlayer/KSAVPlayer.swift
+      - name: Check Xcode
+        run: |
+          set -euo pipefail
           xcodebuild -version
-          swift --version
-      - name: Build macOS
-        run: swift build
-      - name: Build iOS
-        run: swift build --sdk `xcrun -sdk iphonesimulator -show-sdk-path` -Xswiftc -target -Xswiftc arm64-apple-ios13.0-simulator
-      - name: Build tvOS
-        run: swift build --sdk `xcrun -sdk appletvsimulator -show-sdk-path` -Xswiftc -target -Xswiftc arm64-apple-tvos13.0-simulator
-      - name: Test
-        run: swift test -v
+          test "$(xcodebuild -version | head -n 1)" = 'Xcode 26.6'
+      - name: Prepare pinned XcodeGen
+        run: |
+          set -euo pipefail
+          curl --fail --location --silent --show-error \
+            'https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip' \
+            --output "$RUNNER_TEMP/xcodegen.zip"
+          printf '%s  %s\n' '4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806' "$RUNNER_TEMP/xcodegen.zip" > "$RUNNER_TEMP/xcodegen.sha256"
+          shasum -a 256 -c "$RUNNER_TEMP/xcodegen.sha256"
+          unzip -q "$RUNNER_TEMP/xcodegen.zip" -d "$RUNNER_TEMP/xcodegen-tool"
+          test "$("$RUNNER_TEMP/xcodegen-tool/xcodegen/bin/xcodegen" --version)" = 'Version: 2.46.0'
+          "$RUNNER_TEMP/xcodegen-tool/xcodegen/bin/xcodegen" generate --spec "$GITHUB_WORKSPACE/Experiments/AirPlayHandoff/project.yml"
+      - name: Resolve and freeze harness dependency lock
+        run: |
+          set -euo pipefail
+          xcodebuild -resolvePackageDependencies \
+            -project "$GITHUB_WORKSPACE/Experiments/AirPlayHandoff/LumenAirPlayExperiment.xcodeproj" \
+            -scheme LumenAirPlayExperiment -destination 'generic/platform=macOS' \
+            -derivedDataPath "$RUNNER_TEMP/lumen-airplay-derived-data" \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/lumen-airplay-packages" \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=
+          lock="$GITHUB_WORKSPACE/Experiments/AirPlayHandoff/LumenAirPlayExperiment.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
+          jq -e '[.pins[] | select(.identity == "spatialaudiobridge")] as $pins | ($pins | length) == 1 and $pins[0].location == "https://github.com/kristofferR/SpatialAudioBridge" and $pins[0].state.version == env.EXPECTED_SAB_VERSION and $pins[0].state.revision == env.EXPECTED_SAB_REVISION' "$lock"
+          shasum -a 256 "$lock" > "$RUNNER_TEMP/lumen-airplay-lock.sha256"
+      - name: Build unsigned macOS sender only
+        run: |
+          set -euo pipefail
+          xcodebuild -project "$GITHUB_WORKSPACE/Experiments/AirPlayHandoff/LumenAirPlayExperiment.xcodeproj" \
+            -scheme LumenAirPlayExperiment -configuration Debug -destination 'generic/platform=macOS' \
+            -derivedDataPath "$RUNNER_TEMP/lumen-airplay-derived-data" \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/lumen-airplay-packages" \
+            -disableAutomaticPackageResolution ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= build
+      - name: Verify and package temporary app
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/lumen-airplay-derived-data/Build/Products/Debug/LumenAirPlayExperiment.app"
+          test "$(lipo -archs "$app/Contents/MacOS/LumenAirPlayExperiment")" = arm64
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleSupportedPlatforms:0' "$app/Contents/Info.plist")" = MacOSX
+          shasum -a 256 -c "$RUNNER_TEMP/lumen-airplay-lock.sha256"
+          git diff --exit-code
+          git diff --cached --exit-code
+          ditto -c -k --sequesterRsrc --keepParent "$app" "$RUNNER_TEMP/LumenAirPlayExperiment.zip"
+          shasum -a 256 "$RUNNER_TEMP/LumenAirPlayExperiment.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lumen-airplay-macos-${{ github.run_id }}
+          path: ${{ runner.temp }}/LumenAirPlayExperiment.zip
+          retention-days: 3
+          if-no-files-found: error
