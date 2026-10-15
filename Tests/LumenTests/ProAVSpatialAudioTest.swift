@@ -251,6 +251,52 @@ class ProAVSpatialAudioTest: XCTestCase {
         }
     }
 
+    func testReadAheadUsesVideoAfterTheDeclaredAudioEnd() {
+        let flac = ProAVAudioSignaling(codecsAttribute: "fLaC", channels: "8")
+        for audio in [apac, flac] {
+            let session = makeSession()
+            XCTAssertTrue(session.begin(signaling: video, audioSignaling: audio, bandwidth: 12_000_000, resolution: CGSize(width: 1920, height: 1080), frameRate: 23.976))
+            session.playbackTime = 600
+            session.trackVideoTime(seconds: 641.4)
+            for start in [600.0, 602, 604] {
+                session.closeSegment(nextStartTime: start)
+            }
+            if audio.mediaPlaylistName != nil {
+                session.writeAudioInitSegment(Data([0]))
+                session.appendAudioSegment(Data([1]), duration: 3.2)
+            }
+            session.trackAudioTime(seconds: 603.4, duration: 1, streamEnd: 605.4)
+            XCTAssertEqual(session.remuxedAhead(sourceStart: 1.4) ?? -1, 3, accuracy: 0.001)
+            // The last packet reaches the track's declared end, so a long video-only tail can pause.
+            session.trackAudioTime(seconds: 604.4, duration: 1, streamEnd: 605.4)
+            XCTAssertEqual(session.remuxedAhead(sourceStart: 1.4) ?? -1, 40, accuracy: 0.001)
+            session.playbackTime = 620
+            XCTAssertEqual(session.remuxedAhead(sourceStart: 1.4) ?? -1, 20, accuracy: 0.001)
+            session.finish(reachedEnd: false)
+        }
+    }
+
+    func testAudioEndUsesTrackDurationOrMatroskaEndTag() throws {
+        let formatContext = avformat_alloc_context()
+        defer { avformat_free_context(formatContext) }
+        let stream = try XCTUnwrap(avformat_new_stream(formatContext, nil))
+        stream.pointee.time_base = AVRational(num: 1, den: 1000)
+        stream.pointee.start_time = 1000
+        stream.pointee.duration = 5000
+        XCTAssertEqual(MEPlayerItem.audioEndTime(stream: stream.pointee, sourceStart: 10), 6)
+        stream.pointee.start_time = Int64.min
+        XCTAssertEqual(MEPlayerItem.audioEndTime(stream: stream.pointee, sourceStart: 10), 15)
+        XCTAssertEqual(av_dict_set(&stream.pointee.metadata, "DURATION", "00:00:03.250000000", 0), 0)
+        // Matroska stores an absolute end timestamp, not a duration to add to start_time.
+        XCTAssertEqual(MEPlayerItem.audioEndTime(stream: stream.pointee, sourceStart: 10), 3.25)
+        XCTAssertEqual(av_dict_set(&stream.pointee.metadata, "DURATION", "unknown", 0), 0)
+        XCTAssertEqual(MEPlayerItem.audioEndTime(stream: stream.pointee, sourceStart: 10), 15)
+        XCTAssertEqual(av_dict_set(&stream.pointee.metadata, "DURATION", "bad:00:00:03.250", 0), 0)
+        XCTAssertEqual(MEPlayerItem.audioEndTime(stream: stream.pointee, sourceStart: 10), 15)
+        stream.pointee.duration = Int64.min
+        XCTAssertNil(MEPlayerItem.audioEndTime(stream: stream.pointee, sourceStart: 10))
+    }
+
     func testRemuxMeasuresHowFarItReadsAheadOnceReady() {
         let session = makeSession()
         XCTAssertTrue(session.begin(signaling: video, audioSignaling: nil, bandwidth: 12_000_000, resolution: CGSize(width: 1920, height: 1080), frameRate: 23.976))

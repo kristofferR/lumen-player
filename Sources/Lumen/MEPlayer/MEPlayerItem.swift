@@ -26,6 +26,7 @@ public final class MEPlayerItem: Sendable {
     private var remuxTranscoder: ProAVAudioTranscoder?
     private var remuxTranscodeStreamIndex: Int?
     private var remuxSpatialAudio: ProAVSpatialAudioTranscoder?
+    private var remuxAudioEndTime: TimeInterval?
     private var remuxCompleted = false
     private var remuxHeaderWritten = false
     private var remuxMoovWritten = false
@@ -388,6 +389,7 @@ extension MEPlayerItem {
                 KSLog("ProAV audio track skipped: flac transcode unavailable")
             }
             if streamMapping[Int(audioAssetTrack.trackID)] != nil || remuxSpatialAudio != nil {
+                remuxAudioEndTime = Self.audioEndTime(stream: inputAudioStream.pointee, sourceStart: startTime.seconds)
                 audios.forEach { $0.isEnabled = $0.trackID == audioAssetTrack.trackID }
             }
         }
@@ -529,7 +531,25 @@ extension MEPlayerItem {
     private func trackRemuxAudioTime(packet: UnsafeMutablePointer<AVPacket>, stream: UnsafeMutablePointer<AVStream>, session: ProAVRemuxSession) {
         let timestamp = packet.pointee.pts == Int64.min ? packet.pointee.dts : packet.pointee.pts
         guard timestamp != Int64.min else { return }
-        session.trackAudioTime(seconds: Timebase(stream.pointee.time_base).cmtime(for: timestamp).seconds)
+        let timebase = Timebase(stream.pointee.time_base)
+        session.trackAudioTime(seconds: timebase.cmtime(for: timestamp).seconds, duration: timebase.cmtime(for: max(packet.pointee.duration, 0)).seconds, streamEnd: remuxAudioEndTime)
+    }
+
+    /// Matroska's DURATION tag is the track's final timestamp, including the last packet's duration.
+    static func audioEndTime(stream: AVStream, sourceStart: TimeInterval) -> TimeInterval? {
+        if let tag = toDictionary(stream.metadata)["DURATION"] {
+            let parts = tag.split(separator: ":", omittingEmptySubsequences: false)
+            if parts.count == 3, let hours = Double(parts[0]), let minutes = Double(parts[1]), let seconds = Double(parts[2]),
+               hours >= 0, minutes >= 0, minutes < 60, seconds >= 0, seconds < 60
+            {
+                let end = hours * 3600 + minutes * 60 + seconds
+                if end.isFinite, end > 0 { return end }
+            }
+        }
+        guard stream.duration > 0, stream.time_base.num > 0, stream.time_base.den > 0 else { return nil }
+        let timebase = Timebase(stream.time_base)
+        let start = stream.start_time == Int64.min ? sourceStart : timebase.cmtime(for: stream.start_time).seconds
+        return start + timebase.cmtime(for: stream.duration).seconds
     }
 
     private static func requiresParsedHeader(codecID: AVCodecID) -> Bool {
