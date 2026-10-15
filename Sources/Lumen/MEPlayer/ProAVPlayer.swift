@@ -101,6 +101,11 @@ public final class ProAVPlayer {
     /// Replacing an item must not turn a teardown notification into a route change. The generation
     /// also drops notifications already queued by the previous observation.
     private func updateInnerPlayerItem(_ update: () -> Void) {
+        // Capture a real disconnect that may still be queued on the main actor. Once the item is
+        // gone, a false property value can instead be a side effect of our own teardown.
+        if innerPlayer.player.currentItem != nil {
+            externalPlaybackActive = innerPlayer.isExternalPlaybackActive
+        }
         externalPlaybackObservation?.invalidate()
         externalPlaybackObservation = nil
         externalPlaybackObservationGeneration += 1
