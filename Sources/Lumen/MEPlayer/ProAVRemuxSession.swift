@@ -64,6 +64,7 @@ public final class ProAVRemuxSession: @unchecked Sendable {
     private var segmentStart: Double?
     private var lastVideoSeconds: Double?
     private var lastAudioSeconds: Double?
+    private var audioEndSeconds: Double?
     private var currentSegmentBytes = Int64(0)
     private var readyFired = false
     private var finished = false
@@ -146,6 +147,11 @@ public final class ProAVRemuxSession: @unchecked Sendable {
             guard readyFired, let lastVideoSeconds, let _playbackTime else { return nil }
             if audioSignaling != nil {
                 guard let lastAudioSeconds else { return nil }
+                // Once all declared audio is read, its shorter duration must not make the video
+                // tail read without a bound. Unknown ends still wait for audio to avoid starvation.
+                if let audioEndSeconds, lastAudioSeconds >= audioEndSeconds - 0.000001 {
+                    return lastVideoSeconds - sourceStart - _playbackTime
+                }
                 return min(lastVideoSeconds, lastAudioSeconds) - sourceStart - _playbackTime
             }
             return lastVideoSeconds - sourceStart - _playbackTime
@@ -237,9 +243,11 @@ public final class ProAVRemuxSession: @unchecked Sendable {
         }
     }
 
-    func trackAudioTime(seconds: Double) {
+    func trackAudioTime(seconds: Double, duration: Double = 0, streamEnd: Double? = nil) {
         withLock {
-            lastAudioSeconds = max(lastAudioSeconds ?? seconds, seconds)
+            let end = seconds + max(duration, 0)
+            lastAudioSeconds = max(lastAudioSeconds ?? end, end)
+            audioEndSeconds = streamEnd
         }
     }
 

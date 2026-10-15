@@ -503,6 +503,8 @@ extension ProAVPlayer: MediaPlayerProtocol {
     public var pipController: KSPictureInPictureController? { innerPlayer.pipController }
 
     public func prepareToPlay() {
+        // A fresh play must not inherit the route from a previous, terminal shutdown.
+        externalPlaybackActive = innerPlayer.isExternalPlaybackActive
         didFail = false
         startRemux(at: options.startPlayTime)
     }
@@ -558,6 +560,7 @@ extension ProAVPlayer: MediaPlayerProtocol {
         session = nil
         server.stop()
         serverBaseURL = nil
+        externalPlaybackActive = false
     }
 
     public func seek(time: TimeInterval, completion: @escaping ((Bool) -> Void)) {
