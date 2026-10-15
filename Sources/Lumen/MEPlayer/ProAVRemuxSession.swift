@@ -26,9 +26,10 @@ public final class ProAVRemuxSession: @unchecked Sendable {
         var refusedTrackIDs = Set<Int32>()
         /// Off for a launch that retries on FLAC after the conversion failed without refusing the track.
         var isEnabled = true
+        var isExternalPlaybackActive = false
 
         func allows(trackID: Int32) -> Bool {
-            isEnabled && !refusedTrackIDs.contains(trackID)
+            isEnabled && !isExternalPlaybackActive && !refusedTrackIDs.contains(trackID)
         }
     }
 
@@ -62,6 +63,7 @@ public final class ProAVRemuxSession: @unchecked Sendable {
     private var segmentIndex = 0
     private var segmentStart: Double?
     private var lastVideoSeconds: Double?
+    private var lastAudioSeconds: Double?
     private var currentSegmentBytes = Int64(0)
     private var readyFired = false
     private var finished = false
@@ -120,6 +122,13 @@ public final class ProAVRemuxSession: @unchecked Sendable {
         }
     }
 
+    /// Recheck after opening as well as on route changes: the route can change before audio is selected.
+    func needsSpatialAudioRestart(isExternalPlaybackActive: Bool) -> Bool {
+        withLock {
+            isExternalPlaybackActive ? audioSignaling?.mediaPlaylistName != nil : _spatialAudioWithheld
+        }
+    }
+
     /// The player's position from the start of the file, which the remux reads ahead of.
     var playbackTime: TimeInterval? {
         get {
@@ -130,12 +139,15 @@ public final class ProAVRemuxSession: @unchecked Sendable {
         }
     }
 
-    /// How far the remuxed video runs ahead of playback, once the session is ready and both are known,
-    /// so the remux always reaches its readiness gate. Video times are the source's own, which start
-    /// at `sourceStart`.
+    /// Pace the least advanced required stream so pausing the only reader cannot starve audio.
+    /// Source timestamps start at `sourceStart`; playback counts from the start of the file.
     func remuxedAhead(sourceStart: TimeInterval) -> TimeInterval? {
         withLock {
             guard readyFired, let lastVideoSeconds, let _playbackTime else { return nil }
+            if audioSignaling != nil {
+                guard let lastAudioSeconds else { return nil }
+                return min(lastVideoSeconds, lastAudioSeconds) - sourceStart - _playbackTime
+            }
             return lastVideoSeconds - sourceStart - _playbackTime
         }
     }
@@ -222,6 +234,12 @@ public final class ProAVRemuxSession: @unchecked Sendable {
             } else {
                 lastVideoSeconds = seconds
             }
+        }
+    }
+
+    func trackAudioTime(seconds: Double) {
+        withLock {
+            lastAudioSeconds = max(lastAudioSeconds ?? seconds, seconds)
         }
     }
 

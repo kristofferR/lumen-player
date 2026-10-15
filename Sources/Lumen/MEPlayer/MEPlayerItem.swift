@@ -359,7 +359,7 @@ extension MEPlayerItem {
         if let audioAssetTrack, let inputAudioStream = formatCtx.pointee.streams[Int(audioAssetTrack.trackID)] {
             let strategy = ProAVAudioStrategy.make(codecpar: audioAssetTrack.codecpar)
             let spatialAudioPolicy = session.spatialAudioPolicy
-            session.spatialAudioWithheld = !spatialAudioPolicy.isEnabled && !spatialAudioPolicy.refusedTrackIDs.contains(audioAssetTrack.trackID) && ProAVSpatialAudioTranscoder.converts(codecpar: audioAssetTrack.codecpar)
+            session.spatialAudioWithheld = spatialAudioPolicy.isEnabled && spatialAudioPolicy.isExternalPlaybackActive && !spatialAudioPolicy.refusedTrackIDs.contains(audioAssetTrack.trackID) && ProAVSpatialAudioTranscoder.converts(codecpar: audioAssetTrack.codecpar)
             if spatialAudioPolicy.allows(trackID: audioAssetTrack.trackID), let spatialAudio = ProAVSpatialAudioTranscoder(stream: inputAudioStream, session: session) {
                 remuxSpatialAudio = spatialAudio
                 audioSignaling = spatialAudio.signaling
@@ -445,12 +445,18 @@ extension MEPlayerItem {
         let index = Int(corePacket.pointee.stream_index)
         if let remuxSpatialAudio, remuxSpatialAudio.streamIndex == index {
             remuxSpatialAudio.append(packet: corePacket)
+            if let inputStream = formatCtx.pointee.streams[index] {
+                trackRemuxAudioTime(packet: corePacket, stream: inputStream, session: session)
+            }
             return
         }
         guard let outputIndex = streamMapping[index],
               let inputStream = formatCtx.pointee.streams[index],
               let outputStream = outputFormatCtx.pointee.streams[outputIndex]
         else { return }
+        if outputStream.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_AUDIO {
+            trackRemuxAudioTime(packet: corePacket, stream: inputStream, session: session)
+        }
         if index == remuxTranscodeStreamIndex {
             guard let remuxTranscoder else { return }
             let succeeded = remuxTranscoder.transcode(packet: corePacket) { encodedPacket in
@@ -518,6 +524,12 @@ extension MEPlayerItem {
             remuxStreamsAwaitingFirstPacket.remove(outputIndex)
         }
         av_packet_unref(outputPacket)
+    }
+
+    private func trackRemuxAudioTime(packet: UnsafeMutablePointer<AVPacket>, stream: UnsafeMutablePointer<AVStream>, session: ProAVRemuxSession) {
+        let timestamp = packet.pointee.pts == Int64.min ? packet.pointee.dts : packet.pointee.pts
+        guard timestamp != Int64.min else { return }
+        session.trackAudioTime(seconds: Timebase(stream.pointee.time_base).cmtime(for: timestamp).seconds)
     }
 
     private static func requiresParsedHeader(codecID: AVCodecID) -> Bool {

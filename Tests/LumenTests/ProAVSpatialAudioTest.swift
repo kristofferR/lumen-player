@@ -192,6 +192,65 @@ class ProAVSpatialAudioTest: XCTestCase {
         XCTAssertFalse(policy.allows(trackID: 2))
     }
 
+    func testAirPlayPreservesConversionIntentAndRefusedTracks() {
+        var policy = ProAVRemuxSession.SpatialAudioPolicy(refusedTrackIDs: [1])
+        policy.isExternalPlaybackActive = true
+        XCTAssertFalse(policy.allows(trackID: 2))
+        policy.isExternalPlaybackActive = false
+        XCTAssertTrue(policy.allows(trackID: 2))
+        XCTAssertFalse(policy.allows(trackID: 1))
+        policy.isEnabled = false
+        policy.isExternalPlaybackActive = true
+        policy.isExternalPlaybackActive = false
+        XCTAssertFalse(policy.allows(trackID: 2))
+    }
+
+    func testOpeningLaunchRechecksAirPlayAfterAudioIsSelected() {
+        let session = makeSession()
+        XCTAssertFalse(session.needsSpatialAudioRestart(isExternalPlaybackActive: true))
+        XCTAssertTrue(session.begin(signaling: video, audioSignaling: apac, bandwidth: 12_000_000, resolution: CGSize(width: 1920, height: 1080), frameRate: 23.976))
+        XCTAssertTrue(session.needsSpatialAudioRestart(isExternalPlaybackActive: true))
+        XCTAssertFalse(session.needsSpatialAudioRestart(isExternalPlaybackActive: false))
+        session.finish(reachedEnd: false)
+    }
+
+    func testAirPlayWithheldLaunchRetriesOnTheLocalRoute() {
+        let session = makeSession()
+        let flac = ProAVAudioSignaling(codecsAttribute: "fLaC", channels: "8")
+        XCTAssertTrue(session.begin(signaling: video, audioSignaling: flac, bandwidth: 12_000_000, resolution: CGSize(width: 1920, height: 1080), frameRate: 23.976))
+        XCTAssertFalse(session.needsSpatialAudioRestart(isExternalPlaybackActive: false))
+        session.spatialAudioWithheld = true
+        XCTAssertTrue(session.needsSpatialAudioRestart(isExternalPlaybackActive: false))
+        XCTAssertFalse(session.needsSpatialAudioRestart(isExternalPlaybackActive: true))
+        session.finish(reachedEnd: false)
+    }
+
+    func testReadAheadWaitsForBothVideoAndAudio() {
+        let flac = ProAVAudioSignaling(codecsAttribute: "fLaC", channels: "8")
+        for audio in [apac, flac] {
+            let session = makeSession()
+            XCTAssertTrue(session.begin(signaling: video, audioSignaling: audio, bandwidth: 12_000_000, resolution: CGSize(width: 1920, height: 1080), frameRate: 23.976))
+            session.playbackTime = 600
+            session.trackVideoTime(seconds: 641.4)
+            for start in [600.0, 602, 604] {
+                session.closeSegment(nextStartTime: start)
+            }
+            if audio.mediaPlaylistName != nil {
+                session.writeAudioInitSegment(Data([0]))
+                session.appendAudioSegment(Data([1]), duration: 3.2)
+            }
+            XCTAssertNil(session.remuxedAhead(sourceStart: 1.4))
+            session.trackAudioTime(seconds: 603.4)
+            // Forty seconds of video must not pause the reader with only two seconds of audio.
+            XCTAssertEqual(session.remuxedAhead(sourceStart: 1.4) ?? -1, 2, accuracy: 0.001)
+            session.trackAudioTime(seconds: 651.4)
+            XCTAssertEqual(session.remuxedAhead(sourceStart: 1.4) ?? -1, 40, accuracy: 0.001)
+            session.trackAudioTime(seconds: 602)
+            XCTAssertEqual(session.remuxedAhead(sourceStart: 1.4) ?? -1, 40, accuracy: 0.001)
+            session.finish(reachedEnd: false)
+        }
+    }
+
     func testRemuxMeasuresHowFarItReadsAheadOnceReady() {
         let session = makeSession()
         XCTAssertTrue(session.begin(signaling: video, audioSignaling: nil, bandwidth: 12_000_000, resolution: CGSize(width: 1920, height: 1080), frameRate: 23.976))
