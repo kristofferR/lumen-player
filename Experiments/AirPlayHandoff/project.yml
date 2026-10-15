@@ -1,0 +1,39 @@
+name: LumenAirPlayExperiment
+options:
+  deploymentTarget:
+    macOS: '26.0'
+packages:
+  Lumen:
+    path: ../..
+settings:
+  base:
+    SWIFT_VERSION: '5.0'
+targets:
+  LumenAirPlayExperiment:
+    type: application
+    platform: macOS
+    sources:
+      - Sources
+    dependencies:
+      - package: Lumen
+        product: Lumen
+    info:
+      path: Info.plist
+      properties:
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoadsForMedia: true
+          NSAllowsLocalNetworking: true
+        NSHighResolutionCapable: true
+        NSPrincipalClass: NSApplication
+        CFBundleDisplayName: Lumen AirPlay Experiment
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.kristofferr.sab.lumen-airplay-experiment
+        GENERATE_INFOPLIST_FILE: YES
+        ENABLE_APP_SANDBOX: NO
+        CODE_SIGNING_ALLOWED: NO
+schemes:
+  LumenAirPlayExperiment:
+    build:
+      targets:
+        LumenAirPlayExperiment: all

@@ -93,6 +93,12 @@ public class KSAVPlayer {
     private var mediaPlayerTracks = [AVMediaPlayerTrack]()
     private let embedSubtitleDataSouce = AVSubtitleDataSouce()
     private static let sourceSwitchTimeout = TimeInterval(10)
+    /// Temporary AirPlay experiment hook. Only this isolated experiment branch exposes it.
+    public var experimentSourceSwitchReady: (() -> Void)?
+
+    public func experimentCommitSourceSwitch() {
+        commitPendingSourceSwitch()
+    }
     private struct PendingSourceSwitch {
         let item: AVPlayerItem
         let asset: AVURLAsset
@@ -516,7 +522,14 @@ extension KSAVPlayer: MediaPlayerProtocol {
             runOnMainThread {
                 guard let self else { return }
                 if status == .readyToPlay {
-                    self.commitPendingSourceSwitch()
+                    if let checkpoint = self.experimentSourceSwitchReady {
+                        self.sourceSwitchLock.lock()
+                        self.pendingSourceSwitch?.timeout?.cancel()
+                        self.sourceSwitchLock.unlock()
+                        checkpoint()
+                    } else {
+                        self.commitPendingSourceSwitch()
+                    }
                 } else if status == .failed {
                     self.abandonPendingSourceSwitch()
                 }
