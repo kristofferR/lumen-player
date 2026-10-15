@@ -40,6 +40,9 @@ public final class ProAVPlayer {
     private var fallbackResumesPlayback: Bool?
     private var playbackTimeObserver: Any?
     private var externalPlaybackObservation: NSKeyValueObservation?
+    private var externalPlaybackObservationGeneration = 0
+    /// Keep the observed route across item removal, which can clear AVPlayer's active flag.
+    private var externalPlaybackActive = false
     /// The AtmosOutputActivator while a launch plays APAC on tvOS or iOS; releasing it detaches it.
     private var atmosOutput: AnyObject?
     private var reportedReady = false
@@ -79,14 +82,35 @@ public final class ProAVPlayer {
                 self.session?.playbackTime = self.currentPlaybackTime
             }
         }
+        observeExternalPlayback()
+    }
+
+    private func observeExternalPlayback() {
         #if !os(xrOS)
-        externalPlaybackObservation = innerPlayer.player.observe(\.isExternalPlaybackActive) { [weak self] _, _ in
+        let generation = externalPlaybackObservationGeneration
+        externalPlaybackObservation = innerPlayer.player.observe(\.isExternalPlaybackActive) { [weak self] player, _ in
+            let isActive = player.isExternalPlaybackActive
             Task { @MainActor in
-                guard let self else { return }
-                self.externalPlaybackDidChange(isActive: self.innerPlayer.isExternalPlaybackActive)
+                guard let self, self.externalPlaybackObservationGeneration == generation else { return }
+                self.externalPlaybackDidChange(isActive: isActive)
             }
         }
         #endif
+    }
+
+    /// Replacing an item must not turn a teardown notification into a route change. The generation
+    /// also drops notifications already queued by the previous observation.
+    private func updateInnerPlayerItem(_ update: () -> Void) {
+        externalPlaybackObservation?.invalidate()
+        externalPlaybackObservation = nil
+        externalPlaybackObservationGeneration += 1
+        update()
+        // Attachment can activate AirPlay synchronously while observation is suspended. Only an
+        // observed route change may clear the saved state; item removal's false value cannot.
+        if innerPlayer.isExternalPlaybackActive {
+            externalPlaybackActive = true
+        }
+        observeExternalPlayback()
     }
 
     private static var workspaceRoot: URL {
@@ -110,7 +134,7 @@ public final class ProAVPlayer {
         session.preferredAudioTrackID = audioTrackID
         var spatialAudio = spatialAudio
         // An AirPlay receiver plays the stream itself, so the APAC rendition is left out.
-        spatialAudio.isExternalPlaybackActive = innerPlayer.isExternalPlaybackActive
+        spatialAudio.isExternalPlaybackActive = externalPlaybackActive
         session.spatialAudioPolicy = spatialAudio
         session.playbackTime = time
         options.startPlayTime = time
@@ -170,8 +194,11 @@ public final class ProAVPlayer {
         guard !restartForExternalPlaybackIfNeeded() else { return }
         let masterURL = baseURL.appendingPathComponent(directoryName).appendingPathComponent(ProAVRemuxSession.masterPlaylistName)
         updateSpatialAudioOutput()
-        innerPlayer.replace(url: masterURL, options: options)
-        innerPlayer.prepareToPlay()
+        updateInnerPlayerItem {
+            innerPlayer.replace(url: masterURL, options: options)
+            innerPlayer.prepareToPlay()
+        }
+        _ = restartForExternalPlaybackIfNeeded()
     }
 
     /// Plays the activator while the active launch plays APAC on this device: APAC alone doesn't switch
@@ -179,7 +206,7 @@ public final class ProAVPlayer {
     private func updateSpatialAudioOutput() {
         #if (os(tvOS) || os(iOS)) && canImport(SpatialAudioPlayback)
         guard #available(tvOS 26, iOS 26, *) else { return }
-        guard session?.playsSpatialAudio == true, !innerPlayer.isExternalPlaybackActive else {
+        guard session?.playsSpatialAudio == true, !externalPlaybackActive else {
             atmosOutput = nil
             return
         }
@@ -218,6 +245,7 @@ public final class ProAVPlayer {
     }
 
     private func externalPlaybackDidChange(isActive: Bool) {
+        externalPlaybackActive = isActive
         guard !didFail else { return }
         // The activator stops as AirPlay starts, ahead of the restart without APAC.
         updateSpatialAudioOutput()
@@ -245,7 +273,7 @@ public final class ProAVPlayer {
 
     @discardableResult
     private func restartForExternalPlaybackIfNeeded() -> Bool {
-        guard let session, session.needsSpatialAudioRestart(isExternalPlaybackActive: innerPlayer.isExternalPlaybackActive) else { return false }
+        guard let session, session.needsSpatialAudioRestart(isExternalPlaybackActive: externalPlaybackActive) else { return false }
         restartInPlace(spatialAudioEnabled: session.spatialAudioPolicy.isEnabled)
         return true
     }
@@ -269,7 +297,7 @@ public final class ProAVPlayer {
         seekCompletion?(false)
         remuxItem?.delegate = nil
         atmosOutput = nil
-        innerPlayer.shutdown()
+        updateInnerPlayerItem { innerPlayer.shutdown() }
         remuxItem?.shutdown()
         session?.requestCleanup()
         server.stop()
@@ -287,7 +315,7 @@ public final class ProAVPlayer {
         didFail = false
         remuxItem?.delegate = nil
         atmosOutput = nil
-        innerPlayer.shutdown()
+        updateInnerPlayerItem { innerPlayer.shutdown() }
         remuxItem?.shutdown()
         session?.requestCleanup()
         startRemux(at: time, spatialAudioEnabled: spatialAudioEnabled)
@@ -346,7 +374,7 @@ public final class ProAVPlayer {
 
     private func pendingSourceSwitchDidBecomeReady() {
         guard let pending = pendingSourceSwitch else { return }
-        if pending.launch.session.needsSpatialAudioRestart(isExternalPlaybackActive: innerPlayer.isExternalPlaybackActive) {
+        if pending.launch.session.needsSpatialAudioRestart(isExternalPlaybackActive: externalPlaybackActive) {
             restartPendingSourceSwitch(spatialAudio: pending.spatialAudio)
             return
         }
@@ -405,7 +433,7 @@ public final class ProAVPlayer {
         pending.launch.session.requestCleanup()
         pending.completion(false)
         // AirPlay may have ended while this candidate was pending, deferring the active restart.
-        if restoreSpatialAudio, pendingSourceSwitch == nil, !innerPlayer.isExternalPlaybackActive {
+        if restoreSpatialAudio, pendingSourceSwitch == nil, !externalPlaybackActive {
             _ = restartForExternalPlaybackIfNeeded()
         }
     }
@@ -523,7 +551,7 @@ extension ProAVPlayer: MediaPlayerProtocol {
         seekCompletion?(false)
         remuxItem?.delegate = nil
         atmosOutput = nil
-        innerPlayer.shutdown()
+        updateInnerPlayerItem { innerPlayer.shutdown() }
         remuxItem?.shutdown()
         session?.requestCleanup()
         remuxItem = nil
