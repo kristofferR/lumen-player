@@ -127,7 +127,6 @@ struct ProAVVideoSignaling {
 struct ProAVAudioSignaling: Equatable {
     let codecsAttribute: String
     let channels: String?
-    /// The rendition's own media playlist; without one the audio is muxed into the video segments.
     var mediaPlaylistName: String? = nil
 }
 

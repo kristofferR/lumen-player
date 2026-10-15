@@ -71,6 +71,17 @@ final class ProAVSpatialAudioTranscoder: @unchecked Sendable {
         queue.yield(.timeline(origin: origin, videoStart: videoStart))
     }
 
+    /// The muxer's timeline for its first video packet: the muxer shifts it so that the packet decodes
+    /// at zero, deriving a missing decode time from the reorder delay as it does. Nil without any time.
+    static func timeline(pts: Int64, dts: Int64, duration: Int64, videoDelay: Int32, timebase: Timebase) -> (origin: CMTime, videoStart: CMTime)? {
+        let start = pts == Int64.min ? dts : pts
+        guard start != Int64.min else {
+            return nil
+        }
+        let origin = dts == Int64.min ? start - Int64(videoDelay) * duration : dts
+        return (timebase.cmtime(for: origin), timebase.cmtime(for: start))
+    }
+
     func append(packet: UnsafeMutablePointer<AVPacket>) {
         guard let data = packet.pointee.data, packet.pointee.size > 0 else { return }
         let timestamp = packet.pointee.pts == Int64.min ? packet.pointee.dts : packet.pointee.pts
@@ -92,16 +103,26 @@ final class ProAVSpatialAudioTranscoder: @unchecked Sendable {
         queue.finish()
     }
 
+    /// Whether a track would convert on this system, given the chance.
+    static func converts(codecpar: AVCodecParameters) -> Bool {
+        #if canImport(SpatialAudioBridge)
+        if #available(macOS 26, iOS 26, tvOS 26, *) {
+            return codec(codecpar: codecpar) != nil
+        }
+        #endif
+        return false
+    }
+
     #if canImport(SpatialAudioBridge)
     @available(macOS 26, iOS 26, tvOS 26, *)
     static func codec(codecpar: AVCodecParameters) -> SpatialAudioCodec? {
         guard codecpar.sample_rate == 48000 else {
             return nil
         }
-        // FFmpeg reports some DTS:X presentations as plain DTS-HD MA, so every lossless track is
-        // offered and the library tells them apart once it decodes.
+        // FFmpeg reports some DTS:X presentations as plain DTS-HD MA, so every one is offered and the
+        // library tells them apart once it decodes. TrueHD goes by FFmpeg's Atmos label.
         switch codecpar.codec_id {
-        case AV_CODEC_ID_TRUEHD:
+        case AV_CODEC_ID_TRUEHD where codecpar.profile == AV_PROFILE_TRUEHD_ATMOS:
             return .trueHDAtmos
         case AV_CODEC_ID_DTS where [AV_PROFILE_DTS_HD_MA, AV_PROFILE_DTS_HD_MA_X, AV_PROFILE_DTS_HD_MA_X_IMAX].contains(codecpar.profile):
             return .dtsX
@@ -117,11 +138,12 @@ final class ProAVSpatialAudioTranscoder: @unchecked Sendable {
         var held = [(data: Data, time: CMTime?)]()
         var unstartedBytes = 0
         var failed = false
-        // Any library error ends the session at once, so the player restarts on the FLAC path.
+        // Any error ends the session at once, so the player restarts on the FLAC path; a decoding
+        // refusal keeps the track there.
         func fail(_ error: Error) {
             failed = true
             guard !isCancelled else { return }
-            session.failSpatialAudio(NSError(description: "ProAV spatial audio failed: \(error)"))
+            session.failSpatialAudio(NSError(description: "ProAV spatial audio failed: \(error)"), refusedTrackID: Self.refusesTrack(error) ? Int32(streamIndex) : nil)
         }
         func append(_ data: Data, time: CMTime?) async throws {
             guard let timeline else {
@@ -140,7 +162,10 @@ final class ProAVSpatialAudioTranscoder: @unchecked Sendable {
                     case .initialization:
                         session.writeAudioInitSegment(segment.data)
                     case .media:
-                        session.appendAudioSegment(segment.data, duration: segment.duration?.seconds ?? 0)
+                        guard let duration = segment.duration?.seconds, duration > 0 else {
+                            throw SpatialAudioError.encoding("APAC fragment without a duration")
+                        }
+                        session.appendAudioSegment(segment.data, duration: duration)
                     }
                 }, configuration: settings)
             }
@@ -190,8 +215,17 @@ final class ProAVSpatialAudioTranscoder: @unchecked Sendable {
         completion.signal()
     }
 
+    /// Whether the library refused the track itself, rather than failing to convert it this time.
     @available(macOS 26, iOS 26, tvOS 26, *)
-    private static func isSyncPoint(_ data: Data, codec: SpatialAudioCodec) -> Bool {
+    static func refusesTrack(_ error: Error) -> Bool {
+        if case .decoding? = error as? SpatialAudioError {
+            return true
+        }
+        return false
+    }
+
+    @available(macOS 26, iOS 26, tvOS 26, *)
+    static func isSyncPoint(_ data: Data, codec: SpatialAudioCodec) -> Bool {
         let bytes = [UInt8](data.prefix(8))
         switch codec {
         case .trueHDAtmos:

@@ -26,6 +26,7 @@ public final class MEPlayerItem: Sendable {
     private var remuxTranscoder: ProAVAudioTranscoder?
     private var remuxTranscodeStreamIndex: Int?
     private var remuxSpatialAudio: ProAVSpatialAudioTranscoder?
+    private var remuxAudioEndTime: TimeInterval?
     private var remuxCompleted = false
     private var remuxHeaderWritten = false
     private var remuxMoovWritten = false
@@ -358,7 +359,9 @@ extension MEPlayerItem {
         let audioAssetTrack = audios.first { preferredAudioTrackID == nil ? $0.isEnabled : $0.trackID == preferredAudioTrackID } ?? audios.first { $0.isEnabled } ?? audios.first
         if let audioAssetTrack, let inputAudioStream = formatCtx.pointee.streams[Int(audioAssetTrack.trackID)] {
             let strategy = ProAVAudioStrategy.make(codecpar: audioAssetTrack.codecpar)
-            if session.allowsSpatialAudio, let spatialAudio = ProAVSpatialAudioTranscoder(stream: inputAudioStream, session: session) {
+            let spatialAudioPolicy = session.spatialAudioPolicy
+            session.spatialAudioWithheld = spatialAudioPolicy.isEnabled && spatialAudioPolicy.isExternalPlaybackActive && !spatialAudioPolicy.refusedTrackIDs.contains(audioAssetTrack.trackID) && ProAVSpatialAudioTranscoder.converts(codecpar: audioAssetTrack.codecpar)
+            if spatialAudioPolicy.allows(trackID: audioAssetTrack.trackID), let spatialAudio = ProAVSpatialAudioTranscoder(stream: inputAudioStream, session: session) {
                 remuxSpatialAudio = spatialAudio
                 audioSignaling = spatialAudio.signaling
             } else if strategy.copiesBitstream {
@@ -386,6 +389,7 @@ extension MEPlayerItem {
                 KSLog("ProAV audio track skipped: flac transcode unavailable")
             }
             if streamMapping[Int(audioAssetTrack.trackID)] != nil || remuxSpatialAudio != nil {
+                remuxAudioEndTime = Self.audioEndTime(stream: inputAudioStream.pointee, sourceStart: startTime.seconds, formatName: options.formatName)
                 audios.forEach { $0.isEnabled = $0.trackID == audioAssetTrack.trackID }
             }
         }
@@ -443,12 +447,18 @@ extension MEPlayerItem {
         let index = Int(corePacket.pointee.stream_index)
         if let remuxSpatialAudio, remuxSpatialAudio.streamIndex == index {
             remuxSpatialAudio.append(packet: corePacket)
+            if let inputStream = formatCtx.pointee.streams[index] {
+                trackRemuxAudioTime(packet: corePacket, stream: inputStream, session: session)
+            }
             return
         }
         guard let outputIndex = streamMapping[index],
               let inputStream = formatCtx.pointee.streams[index],
               let outputStream = outputFormatCtx.pointee.streams[outputIndex]
         else { return }
+        if outputStream.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_AUDIO {
+            trackRemuxAudioTime(packet: corePacket, stream: inputStream, session: session)
+        }
         if index == remuxTranscodeStreamIndex {
             guard let remuxTranscoder else { return }
             let succeeded = remuxTranscoder.transcode(packet: corePacket) { encodedPacket in
@@ -504,13 +514,10 @@ extension MEPlayerItem {
         outputPacket.pointee.stream_index = Int32(outputIndex)
         av_packet_rescale_ts(outputPacket, inputStream.pointee.time_base, outputStream.pointee.time_base)
         outputPacket.pointee.pos = -1
-        let pts = outputPacket.pointee.pts == Int64.min ? outputPacket.pointee.dts : outputPacket.pointee.pts
-        if let remuxSpatialAudio, !remuxSpatialAudio.hasTimeline, outputStream.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_VIDEO, pts != Int64.min {
-            // The muxer shifts its timeline so that the first packet decodes at zero, deriving a missing
-            // decode time from the reorder delay as it does. The APAC rendition follows the same shift.
-            let timebase = Timebase(outputStream.pointee.time_base)
-            let dts = outputPacket.pointee.dts == Int64.min ? pts - Int64(outputStream.pointee.codecpar.pointee.video_delay) * outputPacket.pointee.duration : outputPacket.pointee.dts
-            remuxSpatialAudio.begin(origin: timebase.cmtime(for: dts), videoStart: timebase.cmtime(for: pts))
+        if let remuxSpatialAudio, !remuxSpatialAudio.hasTimeline, outputStream.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_VIDEO,
+           let timeline = ProAVSpatialAudioTranscoder.timeline(pts: outputPacket.pointee.pts, dts: outputPacket.pointee.dts, duration: outputPacket.pointee.duration, videoDelay: outputStream.pointee.codecpar.pointee.video_delay, timebase: Timebase(outputStream.pointee.time_base))
+        {
+            remuxSpatialAudio.begin(origin: timeline.origin, videoStart: timeline.videoStart)
         }
         let ret = av_write_frame(outputFormatCtx, outputPacket)
         if ret < 0 {
@@ -519,6 +526,32 @@ extension MEPlayerItem {
             remuxStreamsAwaitingFirstPacket.remove(outputIndex)
         }
         av_packet_unref(outputPacket)
+    }
+
+    private func trackRemuxAudioTime(packet: UnsafeMutablePointer<AVPacket>, stream: UnsafeMutablePointer<AVStream>, session: ProAVRemuxSession) {
+        let timestamp = packet.pointee.pts == Int64.min ? packet.pointee.dts : packet.pointee.pts
+        guard timestamp != Int64.min else { return }
+        let timebase = Timebase(stream.pointee.time_base)
+        session.trackAudioTime(seconds: timebase.cmtime(for: timestamp).seconds, duration: timebase.cmtime(for: max(packet.pointee.duration, 0)).seconds, streamEnd: remuxAudioEndTime)
+    }
+
+    /// Matroska's DURATION tag is the track's final timestamp, including the last packet's duration.
+    static func audioEndTime(stream: AVStream, sourceStart: TimeInterval, formatName: String) -> TimeInterval? {
+        if formatName.split(separator: ",").contains(where: { $0 == "matroska" || $0 == "webm" }),
+           let tag = toDictionary(stream.metadata)["DURATION"]
+        {
+            let parts = tag.split(separator: ":", omittingEmptySubsequences: false)
+            if parts.count == 3, let hours = Double(parts[0]), let minutes = Double(parts[1]), let seconds = Double(parts[2]),
+               hours >= 0, minutes >= 0, minutes < 60, seconds >= 0, seconds < 60
+            {
+                let end = hours * 3600 + minutes * 60 + seconds
+                if end.isFinite, end > 0 { return end }
+            }
+        }
+        guard stream.duration > 0, stream.time_base.num > 0, stream.time_base.den > 0 else { return nil }
+        let timebase = Timebase(stream.time_base)
+        let start = stream.start_time == Int64.min ? sourceStart : timebase.cmtime(for: stream.start_time).seconds
+        return start + timebase.cmtime(for: stream.duration).seconds
     }
 
     private static func requiresParsedHeader(codecID: AVCodecID) -> Bool {
@@ -1101,7 +1134,15 @@ extension MEPlayerItem: MediaPlayback {
 
 extension MEPlayerItem: CodecCapacityDelegate {
     func codecDidChangeCapacity() {
-        guard remuxSession == nil else {
+        if let remuxSession {
+            // The remux reads ahead of playback by the buffer duration, as the decoding path buffers.
+            if let ahead = remuxSession.remuxedAhead(sourceStart: startTime.seconds) {
+                if ahead > options.maxBufferDuration {
+                    pause()
+                } else if ahead < options.maxBufferDuration / 2 {
+                    resume()
+                }
+            }
             return
         }
         let loadingState = options.playable(capacitys: videoAudioTracks, isFirst: isFirst, isSeek: isSeek)
