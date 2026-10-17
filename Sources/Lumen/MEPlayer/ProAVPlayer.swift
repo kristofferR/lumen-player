@@ -33,7 +33,7 @@ public final class ProAVPlayer {
     private var delegateProxy: ProAVLaunchDelegateProxy?
     private var pendingSourceSwitch: PendingSourceSwitch?
     private var preferredAudioTrackID: Int32?
-    /// Audio tracks of this source that the library refused; they keep the FLAC path.
+    /// Audio tracks of this source that the library or a launch's probe refused; they keep the FLAC path.
     private var refusedSpatialAudioTrackIDs = Set<Int32>()
     /// Whether playback resumes after an in-place restart, for the FLAC fallback or AirPlay, of a launch
     /// that was already playing.
@@ -312,6 +312,10 @@ public final class ProAVPlayer {
 
     private func restart(at time: TimeInterval, completion: ((Bool) -> Void)?, spatialAudioEnabled: Bool = true) {
         abortPendingSourceSwitch()
+        // Keep the tracks the launch's probe refused.
+        if let session {
+            refusedSpatialAudioTrackIDs.formUnion(session.spatialAudioPolicy.refusedTrackIDs)
+        }
         let previousCompletion = pendingSeekCompletion
         pendingSeekCompletion = nil
         previousCompletion?(false)
@@ -411,7 +415,7 @@ public final class ProAVPlayer {
         url = pending.url
         options = pending.options
         preferredAudioTrackID = nil
-        refusedSpatialAudioTrackIDs = pending.spatialAudio.refusedTrackIDs
+        refusedSpatialAudioTrackIDs = pending.launch.session.spatialAudioPolicy.refusedTrackIDs
         session = pending.launch.session
         remuxItem = pending.launch.item
         delegateProxy = pending.launch.proxy

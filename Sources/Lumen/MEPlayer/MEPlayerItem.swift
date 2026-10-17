@@ -361,7 +361,12 @@ extension MEPlayerItem {
             let strategy = ProAVAudioStrategy.make(codecpar: audioAssetTrack.codecpar)
             let spatialAudioPolicy = session.spatialAudioPolicy
             session.spatialAudioWithheld = spatialAudioPolicy.isEnabled && spatialAudioPolicy.isExternalPlaybackActive && !spatialAudioPolicy.refusedTrackIDs.contains(audioAssetTrack.trackID) && ProAVSpatialAudioTranscoder.converts(codecpar: audioAssetTrack.codecpar)
-            let triesSpatialAudio = spatialAudioPolicy.allows(trackID: audioAssetTrack.trackID) && !probeRefusesSpatialAudio(stream: inputAudioStream, formatCtx: formatCtx)
+            var triesSpatialAudio = spatialAudioPolicy.allows(trackID: audioAssetTrack.trackID)
+            if triesSpatialAudio, probeRefusesSpatialAudio(stream: inputAudioStream, formatCtx: formatCtx) {
+                triesSpatialAudio = false
+                // Later launches of this source skip the probe.
+                session.spatialAudioPolicy.refusedTrackIDs.insert(audioAssetTrack.trackID)
+            }
             guard error == nil else { return }
             if triesSpatialAudio, let spatialAudio = ProAVSpatialAudioTranscoder(stream: inputAudioStream, session: session) {
                 remuxSpatialAudio = spatialAudio
