@@ -361,7 +361,9 @@ extension MEPlayerItem {
             let strategy = ProAVAudioStrategy.make(codecpar: audioAssetTrack.codecpar)
             let spatialAudioPolicy = session.spatialAudioPolicy
             session.spatialAudioWithheld = spatialAudioPolicy.isEnabled && spatialAudioPolicy.isExternalPlaybackActive && !spatialAudioPolicy.refusedTrackIDs.contains(audioAssetTrack.trackID) && ProAVSpatialAudioTranscoder.converts(codecpar: audioAssetTrack.codecpar)
-            if spatialAudioPolicy.allows(trackID: audioAssetTrack.trackID), !probeRefusesSpatialAudio(stream: inputAudioStream, formatCtx: formatCtx), let spatialAudio = ProAVSpatialAudioTranscoder(stream: inputAudioStream, session: session) {
+            let triesSpatialAudio = spatialAudioPolicy.allows(trackID: audioAssetTrack.trackID) && !probeRefusesSpatialAudio(stream: inputAudioStream, formatCtx: formatCtx)
+            guard error == nil else { return }
+            if triesSpatialAudio, let spatialAudio = ProAVSpatialAudioTranscoder(stream: inputAudioStream, session: session) {
                 remuxSpatialAudio = spatialAudio
                 audioSignaling = spatialAudio.signaling
             } else if strategy.copiesBitstream {
@@ -423,7 +425,7 @@ extension MEPlayerItem {
     /// Whether the library will refuse a track the conversion would take, such as DTS-HD MA without
     /// DTS:X, so it plays through FLAC from the start instead of failing the launch. The probe reads
     /// ahead, so it needs a seekable source, and a launch from the start rewinds afterwards; the read
-    /// thread seeks a later start itself.
+    /// thread seeks a later start itself. A launch that cannot rewind fails rather than skip the start.
     private func probeRefusesSpatialAudio(stream: UnsafeMutablePointer<AVStream>, formatCtx: UnsafeMutablePointer<AVFormatContext>) -> Bool {
         guard seekable, let codecpar = stream.pointee.codecpar, ProAVSpatialAudioTranscoder.converts(codecpar: codecpar.pointee) else {
             return false
@@ -433,7 +435,8 @@ extension MEPlayerItem {
             let start = seekByBytes || formatCtx.pointee.start_time == Int64.min ? 0 : formatCtx.pointee.start_time
             let result = avformat_seek_file(formatCtx, -1, Int64.min, start, Int64.max, seekByBytes ? AVSEEK_FLAG_BYTE : 0)
             if result < 0 {
-                KSLog("ProAV spatial audio probe could not rewind: \(result)")
+                error = NSError(description: "ProAV spatial audio probe could not rewind: \(result)")
+                return false
             }
         }
         guard let refusal else {
