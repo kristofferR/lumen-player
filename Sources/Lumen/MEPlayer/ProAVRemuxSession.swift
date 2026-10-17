@@ -304,10 +304,10 @@ public final class ProAVRemuxSession: @unchecked Sendable {
         withLock { failLocked(error) }
     }
 
-    func failSpatialAudio(_ error: NSError, refusedTrackID: Int32?) {
+    func failSpatialAudio(_ error: NSError, failure: SpatialAudioFailure) {
         withLock {
             guard !failed else { return }
-            _spatialAudioFailure = refusedTrackID.map { .refused(trackID: $0) } ?? .failed
+            _spatialAudioFailure = failure
             failLocked(error)
         }
     }

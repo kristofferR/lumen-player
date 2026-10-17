@@ -53,33 +53,24 @@ class ProAVSpatialAudioTest: XCTestCase {
         #endif
     }
 
-    func testConversionStartsAtASyncPoint() throws {
+    func testOnlyUnsupportedTracksAreRefused() throws {
         #if canImport(SpatialAudioBridge)
         guard #available(macOS 26, iOS 26, tvOS 26, *) else {
             throw XCTSkip("SpatialAudioBridge requires macOS, iOS or tvOS 26")
         }
-        let majorSync = Data([0x12, 0x34, 0x56, 0x78, 0xF8, 0x72, 0x6F, 0xBA, 0x00])
-        let mlpMajorSync = Data([0x12, 0x34, 0x56, 0x78, 0xF8, 0x72, 0x6F, 0xBB, 0x00])
-        XCTAssertTrue(ProAVSpatialAudioTranscoder.isSyncPoint(majorSync, codec: .trueHDAtmos))
-        XCTAssertFalse(ProAVSpatialAudioTranscoder.isSyncPoint(mlpMajorSync, codec: .trueHDAtmos))
-        XCTAssertFalse(ProAVSpatialAudioTranscoder.isSyncPoint(majorSync.prefix(6), codec: .trueHDAtmos))
-        XCTAssertTrue(ProAVSpatialAudioTranscoder.isSyncPoint(Data([0x7F, 0xFE, 0x80, 0x01, 0xFC]), codec: .dtsX))
-        XCTAssertFalse(ProAVSpatialAudioTranscoder.isSyncPoint(Data([0xFE, 0x7F, 0x01, 0x80, 0xFC]), codec: .dtsX))
-        #else
-        throw XCTSkip("SpatialAudioBridge is unavailable on this platform")
-        #endif
-    }
-
-    func testOnlyDecodingErrorsRefuseTheTrack() throws {
-        #if canImport(SpatialAudioBridge)
-        guard #available(macOS 26, iOS 26, tvOS 26, *) else {
-            throw XCTSkip("SpatialAudioBridge requires macOS, iOS or tvOS 26")
+        XCTAssertEqual(ProAVSpatialAudioTranscoder.failure(for: SpatialAudioError.unsupported("This TrueHD stream has no Atmos presentation"), trackID: 1), .refused(trackID: 1))
+        // A discontinuity lies ahead of playback, so like a transient error it falls back for the launch.
+        let launchOnly: [Error] = [
+            SpatialAudioError.discontinuity("Timestamps jumped"),
+            SpatialAudioError.decoding("Atmos presentation has no object metadata within 0.5 s"),
+            SpatialAudioError.encoding("APAC encoder stopped"),
+            SpatialAudioError.source("No sync point or video timeline within 8 MB of audio"),
+            SpatialAudioError.coreMedia(-12780),
+            CancellationError(),
+        ]
+        for error in launchOnly {
+            XCTAssertEqual(ProAVSpatialAudioTranscoder.failure(for: error, trackID: 1), .failed, "\(error)")
         }
-        XCTAssertTrue(ProAVSpatialAudioTranscoder.refusesTrack(SpatialAudioError.decoding("This TrueHD stream has no Atmos presentation")))
-        XCTAssertFalse(ProAVSpatialAudioTranscoder.refusesTrack(SpatialAudioError.encoding("APAC encoder stopped")))
-        XCTAssertFalse(ProAVSpatialAudioTranscoder.refusesTrack(SpatialAudioError.source("No sync point or video timeline within 8 MB of audio")))
-        XCTAssertFalse(ProAVSpatialAudioTranscoder.refusesTrack(SpatialAudioError.coreMedia(-12780)))
-        XCTAssertFalse(ProAVSpatialAudioTranscoder.refusesTrack(CancellationError()))
         #else
         throw XCTSkip("SpatialAudioBridge is unavailable on this platform")
         #endif
@@ -175,11 +166,11 @@ class ProAVSpatialAudioTest: XCTestCase {
     func testOnlySpatialAudioFailuresFallBackToFLAC() {
         let failed = makeSession()
         failed.fail(NSError(description: "segment write failed"))
-        failed.failSpatialAudio(NSError(description: "unsupported metadata"), refusedTrackID: 1)
+        failed.failSpatialAudio(NSError(description: "unsupported metadata"), failure: .refused(trackID: 1))
         XCTAssertTrue(failed.isFailed)
         XCTAssertNil(failed.spatialAudioFailure)
         let refused = makeSession()
-        refused.failSpatialAudio(NSError(description: "unsupported metadata"), refusedTrackID: 1)
+        refused.failSpatialAudio(NSError(description: "unsupported metadata"), failure: .refused(trackID: 1))
         XCTAssertTrue(refused.isFailed)
         XCTAssertEqual(refused.spatialAudioFailure, .refused(trackID: 1))
     }
