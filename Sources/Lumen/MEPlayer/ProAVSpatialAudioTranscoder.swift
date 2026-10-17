@@ -7,8 +7,9 @@ import SpatialAudioBridge
 #endif
 
 /// Converts a TrueHD Atmos or DTS:X track to APAC, which the remux serves as a separate audio
-/// rendition instead of the FLAC transcode. A track without Atmos or DTS:X fails the session as
-/// decoding starts, and the player then plays it through the FLAC transcode.
+/// rendition instead of the FLAC transcode. A probe before the launch keeps a track the library refuses
+/// on FLAC; one the probe cannot judge fails the session as decoding starts, and the player then
+/// plays it through the FLAC transcode.
 ///
 /// The read thread hands packets over and blocks while the conversion is behind, so the remux runs at
 /// its pace. Fragments are placed on the muxer's timeline once `begin(origin:videoStart:)` says where
@@ -111,6 +112,51 @@ final class ProAVSpatialAudioTranscoder: @unchecked Sendable {
         }
         #endif
         return false
+    }
+
+    /// Why the library will never render the track, found by decoding about a second of it from its
+    /// first sync point without encoding; nil when it renders or the probe cannot tell. Reads the
+    /// demuxer onward from where it is.
+    static func probeRefusal(stream: UnsafeMutablePointer<AVStream>, formatContext: UnsafeMutablePointer<AVFormatContext>) -> String? {
+        #if canImport(SpatialAudioBridge)
+        guard #available(macOS 26, iOS 26, tvOS 26, *),
+              let codecpar = stream.pointee.codecpar,
+              let codec = codec(codecpar: codecpar.pointee)
+        else {
+            return nil
+        }
+        var packet = av_packet_alloc()
+        defer { av_packet_free(&packet) }
+        guard let packet else { return nil }
+        let timebase = Timebase(stream.pointee.time_base)
+        var audio = Data()
+        var start: CMTime?
+        var bytesRead = 0
+        // The video read around the audio counts as well, so a track without a sync point ends it.
+        while bytesRead < 32 << 20, audio.count < 8 << 20, av_read_frame(formatContext, packet) == 0 {
+            defer { av_packet_unref(packet) }
+            bytesRead += Int(packet.pointee.size)
+            guard packet.pointee.stream_index == stream.pointee.index, let bytes = packet.pointee.data, packet.pointee.size > 0 else { continue }
+            let data = Data(bytes: bytes, count: Int(packet.pointee.size))
+            guard !audio.isEmpty || codec.isSyncPoint(data) else { continue }
+            let timestamp = packet.pointee.pts == Int64.min ? packet.pointee.dts : packet.pointee.pts
+            if timestamp != Int64.min {
+                let time = timebase.cmtime(for: timestamp)
+                if let start, (time - start).seconds >= 1 {
+                    break
+                }
+                start = start ?? time
+            }
+            audio += data
+        }
+        // Damaged audio is for the conversion to judge, which falls back for this launch only.
+        guard case let .unsupported(reason)? = try? codec.probe(audio) else {
+            return nil
+        }
+        return reason
+        #else
+        return nil
+        #endif
     }
 
     #if canImport(SpatialAudioBridge)

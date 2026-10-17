@@ -361,7 +361,7 @@ extension MEPlayerItem {
             let strategy = ProAVAudioStrategy.make(codecpar: audioAssetTrack.codecpar)
             let spatialAudioPolicy = session.spatialAudioPolicy
             session.spatialAudioWithheld = spatialAudioPolicy.isEnabled && spatialAudioPolicy.isExternalPlaybackActive && !spatialAudioPolicy.refusedTrackIDs.contains(audioAssetTrack.trackID) && ProAVSpatialAudioTranscoder.converts(codecpar: audioAssetTrack.codecpar)
-            if spatialAudioPolicy.allows(trackID: audioAssetTrack.trackID), let spatialAudio = ProAVSpatialAudioTranscoder(stream: inputAudioStream, session: session) {
+            if spatialAudioPolicy.allows(trackID: audioAssetTrack.trackID), !probeRefusesSpatialAudio(stream: inputAudioStream, formatCtx: formatCtx), let spatialAudio = ProAVSpatialAudioTranscoder(stream: inputAudioStream, session: session) {
                 remuxSpatialAudio = spatialAudio
                 audioSignaling = spatialAudio.signaling
             } else if strategy.copiesBitstream {
@@ -418,6 +418,29 @@ extension MEPlayerItem {
             inputIndex == remuxTranscodeStreamIndex ? nil : outputIndex
         })
         outputPacket = av_packet_alloc()
+    }
+
+    /// Whether the library will refuse a track the conversion would take, such as DTS-HD MA without
+    /// DTS:X, so it plays through FLAC from the start instead of failing the launch. The probe reads
+    /// ahead, so it needs a seekable source, and a launch from the start rewinds afterwards; the read
+    /// thread seeks a later start itself.
+    private func probeRefusesSpatialAudio(stream: UnsafeMutablePointer<AVStream>, formatCtx: UnsafeMutablePointer<AVFormatContext>) -> Bool {
+        guard seekable, let codecpar = stream.pointee.codecpar, ProAVSpatialAudioTranscoder.converts(codecpar: codecpar.pointee) else {
+            return false
+        }
+        let refusal = ProAVSpatialAudioTranscoder.probeRefusal(stream: stream, formatContext: formatCtx)
+        if options.startPlayTime <= 0 {
+            let start = seekByBytes || formatCtx.pointee.start_time == Int64.min ? 0 : formatCtx.pointee.start_time
+            let result = avformat_seek_file(formatCtx, -1, Int64.min, start, Int64.max, seekByBytes ? AVSEEK_FLAG_BYTE : 0)
+            if result < 0 {
+                KSLog("ProAV spatial audio probe could not rewind: \(result)")
+            }
+        }
+        guard let refusal else {
+            return false
+        }
+        KSLog(level: .info, "ProAV spatial audio unsupported: \(refusal); playing FLAC")
+        return true
     }
 
     private func overrideDolbyVisionConfigurationRecord(codecpar: UnsafeMutablePointer<AVCodecParameters>) -> Bool {
