@@ -1,0 +1,94 @@
+# Fork-only validation: push a branch named validation/<name> holding the candidate plus this one file.
+# A name ending in -tv also builds the unsigned tvOS example app.
+name: Lumen fork validation (push)
+
+on:
+  push:
+    branches:
+      - 'validation/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lumen-fork-validation-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    if: github.repository == 'kristofferR/lumen-player'
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      EXPECTED_SAB_VERSION: 2.0.0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Check that only this workflow was added to the candidate
+        run: |
+          test "$(git diff --name-only HEAD^ HEAD)" = ".github/workflows/fork-validation.yml"
+          echo "Candidate: $(git rev-parse HEAD^)"
+          test "$(xcodebuild -version | head -n 1)" = "Xcode 26.6"
+      - name: Build macOS (arm64 and x86_64)
+        # One build per architecture: SwiftPM's multi-architecture build needs the Metal toolchain.
+        run: |
+          swift build --arch arm64
+          swift build --arch x86_64 --scratch-path .build-x86_64
+      - name: Verify resolved SpatialAudioBridge
+        run: jq -e '[.pins[] | select(.identity == "spatialaudiobridge")] as $pins | ($pins | length) == 1 and $pins[0].state.version == env.EXPECTED_SAB_VERSION' Package.resolved
+      - name: Test macOS
+        run: swift test --arch arm64
+      - name: Build iOS and tvOS Simulators
+        run: |
+          swift build --scratch-path .build-ios --sdk "$(xcrun --sdk iphonesimulator --show-sdk-path)" --triple arm64-apple-ios13.0-simulator
+          swift build --scratch-path .build-tvos --sdk "$(xcrun --sdk appletvsimulator --show-sdk-path)" --triple arm64-apple-tvos13.0-simulator
+      - name: Test iOS and tvOS Simulators
+        run: |
+          set -euo pipefail
+          scheme=Lumen-Package
+          xcodebuild -list | grep -qx "        $scheme" || scheme=Lumen
+          for platform in iOS tvOS; do
+            case $platform in
+              iOS) family=iPhone ;;
+              tvOS) family="Apple TV" ;;
+            esac
+            udid=$(xcrun simctl list devices available -j | jq -r --arg family "$family" --arg runtime "$platform" '[.devices | to_entries[] | select(.key | test("SimRuntime\\." + $runtime + "-2[6-9]")) | .value[] | select(.name | startswith($family))][0].udid')
+            test -n "$udid" && test "$udid" != null
+            xcodebuild test -scheme "$scheme" -destination "id=$udid" -derivedDataPath ".build-xcode-$platform" -skipPackagePluginValidation ARCHS=arm64 | tail -n 40
+          done
+
+  tv-app:
+    if: github.repository == 'kristofferR/lumen-player' && endsWith(github.ref_name, '-tv')
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Build the unsigned tvOS example app
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin feat/lumen-player-example
+          git checkout FETCH_HEAD -- Examples/LumenPlayer
+          brew install xcodegen
+          cd Examples/LumenPlayer
+          xcodegen generate --spec project.yml
+          xcodebuild -project LumenPlayer.xcodeproj -scheme LumenPlayer -configuration Debug \
+            -destination generic/platform=tvOS -derivedDataPath "$RUNNER_TEMP/dd" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO PRODUCT_BUNDLE_IDENTIFIER=com.kristofferr.sab.lumen.example \
+            build | tail -n 40
+          app="$RUNNER_TEMP/dd/Build/Products/Debug-appletvos/LumenPlayer.app"
+          test -d "$app/Frameworks/SpatialAudioCore.framework"
+          ditto -c -k --keepParent "$app" "$RUNNER_TEMP/LumenPlayer-tvos-unsigned.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LumenPlayer-tvos-unsigned
+          path: ${{ runner.temp }}/LumenPlayer-tvos-unsigned.zip
+          retention-days: 3
